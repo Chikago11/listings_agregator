@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from urllib.parse import urlparse
 from urllib.parse import quote as url_quote
 
 # Нормализуем названия бирж (чтобы "🔵MEXC", "MEXC", "mexc" -> "mexc")
@@ -70,6 +71,9 @@ def build_exchange_link(exchange: str, market_type: str, base: str, quote: str =
             return f"https://www.gate.com/ru/trade/{sym_usdt_underscore(base, quote)}"
 
     # -------- Binance --------
+    if ex == "binance alpha":
+        return "https://www.binance.com/ru/alpha"
+
     if ex == "binance":
         if mt == "futures":
             # https://www.binance.com/ru/futures/UAIUSDT
@@ -204,5 +208,99 @@ def build_exchange_link(exchange: str, market_type: str, base: str, quote: str =
 
     if ex in PERP_EXCHANGES:
         return PERP_EXCHANGES[ex]
+
+    return None
+
+
+def infer_market_type_from_url(url: str) -> str | None:
+    """
+    Best-effort inference of market type from an exchange URL.
+
+    Returns: 'spot' | 'futures' | None
+    """
+    if not url:
+        return None
+
+    try:
+        p = urlparse(url.strip())
+    except Exception:
+        return None
+
+    host = (p.netloc or "").lower()
+    path = (p.path or "").lower()
+    query = (p.query or "").lower()
+
+    # Ourbit: separate futures subdomain
+    if host.startswith("futures.ourbit.com"):
+        return "futures"
+
+    # Exchange-specific patterns
+    if "binance.com" in host:
+        if "/futures/" in path:
+            return "futures"
+        if "/trade/" in path and ("type=spot" in query or "type=spot" in url.lower()):
+            return "spot"
+        if "/trade/" in path:
+            return "spot"
+
+    if "okx.com" in host:
+        if "/trade-swap/" in path:
+            return "futures"
+        if "/trade-spot/" in path:
+            return "spot"
+
+    if "mexc.com" in host:
+        if "/futures/" in path:
+            return "futures"
+        if "/exchange/" in path:
+            return "spot"
+
+    if "gate.com" in host:
+        if "/futures/" in path:
+            return "futures"
+        if "/trade/" in path:
+            return "spot"
+
+    if "bitget.com" in host:
+        if "/futures/" in path:
+            return "futures"
+        if "/spot/" in path:
+            return "spot"
+
+    if "bybit.com" in host:
+        if "/trade/usdt/" in path:
+            return "futures"
+        if "/trade/spot/" in path:
+            return "spot"
+
+    if "xt.com" in host:
+        if "/futures/" in path:
+            return "futures"
+        if "/trade/" in path:
+            return "spot"
+
+    if "coinex.com" in host:
+        if "/futures/" in path:
+            return "futures"
+        if "/exchange/" in path:
+            return "spot"
+
+    if "bitmart.com" in host:
+        if "type=spot" in query:
+            return "spot"
+    if "derivatives.bitmart.com" in host:
+        return "futures"
+
+    if "kcex.com" in host:
+        if "/futures/" in path:
+            return "futures"
+        if "/exchange/" in path:
+            return "spot"
+
+    # Generic fallback (less precise)
+    if any(x in path for x in ("/futures/", "/perpetual/", "/contract/", "/derivatives/")):
+        return "futures"
+    if any(x in path for x in ("/spot/", "/exchange/")):
+        return "spot"
 
     return None

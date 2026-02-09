@@ -18,6 +18,7 @@ from channels import CHANNELS
 from db import init_db, is_seen, mark_seen, gc
 from parser import normalize_text, extract  # extract_many если подключишь позже
 from sender import send_alert
+from ex_links import build_exchange_link
 
 
 def msg_url(channel_username: str, message_id: int) -> str:
@@ -95,20 +96,44 @@ async def run():
                         return
                     await mark_seen(k, DEDUP_STRUCT_TTL_SEC)
 
-                ex = (meta.get("exchange") or "unknown").upper()
-                mt = (meta.get("market_type") or "unknown").upper()
+                mt_raw = (meta.get("market_type") or "").strip().lower()
                 sym = meta.get("display") or (meta.get("base") or "?")
 
-                head = f"{ex} | {mt} | {sym}"
 
                 source_url = msg_url(ch, msg_id)
                 # ✅ ссылка зашита в название канала
-                src_line = f'🔗 <b>Источник:</b> <a href="{source_url}">@{ch}</a>'
+
+                token_emoji = "\U0001FA99"  # 🪙
+                source_emoji = "\U0001F517"  # 🔗
+
+                tag = "?"
+                if mt_raw == "futures":
+                    tag = "F"
+                elif mt_raw == "spot":
+                    tag = "S"
+
+                ex_name = (meta.get("exchange") or "unknown").strip()
+                base = (meta.get("base") or "").strip()
+                quote = (meta.get("quote") or "USDT").strip().upper()
+
+                ex_url = None
+                if ex_name and base and mt_raw in ("spot", "futures"):
+                    ex_url = build_exchange_link(ex_name, mt_raw, base=base, quote=quote)
+
+                if ex_url:
+                    ex_part = f'<a href="{html.escape(ex_url, quote=True)}">{html.escape(ex_name)}</a>({tag})'
+                else:
+                    ex_part = f"{html.escape(ex_name)}({tag})"
+
+                line1 = f'{token_emoji}<b>{html.escape(str(sym))}</b>: {ex_part}'
+
+                src_title = getattr(event.chat, "title", None) or f"@{ch}"
+                src_line = f'{source_emoji} <b>Источник:</b> <a href="{html.escape(source_url, quote=True)}">{html.escape(str(src_title))}</a>'
 
                 if len(body_html) > 3000:
                     body_html = body_html[:3000] + "…"
 
-                alert_html = f"{head}\n{src_line}\n\n{body_html}"
+                alert_html = f"{line1}\n{src_line}\n\n{body_html}"
 
                 # шлём без кнопок
                 await send_alert(alert_html, parse_mode="HTML")

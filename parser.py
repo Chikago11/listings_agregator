@@ -1,5 +1,7 @@
 import re
 
+from ex_links import infer_market_type_from_url
+
 EXCHANGES = {
     "binance",
     "bybit",
@@ -93,6 +95,17 @@ def _infer_market_type_from_urls(raw: str) -> str | None:
     if not urls:
         return None
 
+    # Prefer exchange-aware heuristics based on known exchange URL patterns/templates.
+    have_spot = False
+    for u in urls:
+        mt = infer_market_type_from_url(u)
+        if mt == "futures":
+            return "futures"
+        if mt == "spot":
+            have_spot = True
+    if have_spot:
+        return "spot"
+
     ujoin = " ".join(urls).lower()
 
     # приоритет: если явно фьючи — futures
@@ -150,16 +163,14 @@ def extract(text: str) -> dict:
     elif re.search(r"\(\s*s\s*\)", t) or re.search(r"\[\s*s\s*\]", t):
         market_type = "spot"
     else:
-        if any(w in t for w in FUTURES_WORDS):
+        mt_url = _infer_market_type_from_urls(raw)
+        if mt_url:
+            market_type = mt_url
+        elif any(w in t for w in FUTURES_WORDS):
             market_type = "futures"
         elif "spot" in t:
             market_type = "spot"
         # --- fallback: market_type по ссылкам (если словами не нашли) ---
-        if market_type is None:
-            mt_url = _infer_market_type_from_urls(raw)
-            if mt_url:
-                market_type = mt_url
-
     base = None
     quote = None
     # Binance Alpha чаще всего означает спот-листинг
