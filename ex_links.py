@@ -297,6 +297,12 @@ def infer_market_type_from_url(url: str) -> str | None:
         if "/exchange/" in path:
             return "spot"
 
+    if "kucoin.com" in host:
+        if "/trade/futures/" in path:
+            return "futures"
+        if "/trade/" in path:
+            return "spot"
+
     # Generic fallback (less precise)
     if any(x in path for x in ("/futures/", "/perpetual/", "/contract/", "/derivatives/")):
         return "futures"

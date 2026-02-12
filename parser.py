@@ -1,4 +1,4 @@
-import re
+﻿import re
 
 from ex_links import infer_market_type_from_url
 
@@ -27,7 +27,7 @@ EXCHANGES = {
     "Lighter",
 }
 
-# что считаем "котировкой" (quote)
+# С‡С‚Рѕ СЃС‡РёС‚Р°РµРј "РєРѕС‚РёСЂРѕРІРєРѕР№" (quote)
 QUOTES = {
     "USDT",
     "USDC",
@@ -59,9 +59,9 @@ FUTURES_WORDS = {
 
 SPOT_URL_HINTS = {
     "/spot/",
-    "/trade/",  # многие spot/trade страницы
+    "/trade/",  # РјРЅРѕРіРёРµ spot/trade СЃС‚СЂР°РЅРёС†С‹
     "trade-spot",  # okx spot
-    "exchange",  # mexc spot часто /exchange/
+    "exchange",  # mexc spot С‡Р°СЃС‚Рѕ /exchange/
 }
 
 FUT_URL_HINTS = {
@@ -71,7 +71,7 @@ FUT_URL_HINTS = {
     "swap",
     "contract",
     "derivatives",
-    "umcbl",  # bitget фьюч-идентификатор часто в symbolId
+    "umcbl",  # bitget С„СЊСЋС‡-РёРґРµРЅС‚РёС„РёРєР°С‚РѕСЂ С‡Р°СЃС‚Рѕ РІ symbolId
 }
 
 
@@ -108,11 +108,11 @@ def _infer_market_type_from_urls(raw: str) -> str | None:
 
     ujoin = " ".join(urls).lower()
 
-    # приоритет: если явно фьючи — futures
+    # РїСЂРёРѕСЂРёС‚РµС‚: РµСЃР»Рё СЏРІРЅРѕ С„СЊСЋС‡Рё вЂ” futures
     if any(h in ujoin for h in FUT_URL_HINTS):
         return "futures"
 
-    # иначе spot
+    # РёРЅР°С‡Рµ spot
     if any(h in ujoin for h in SPOT_URL_HINTS):
         return "spot"
 
@@ -123,9 +123,9 @@ def _display_symbol(base: str | None, quote: str | None) -> str | None:
     if not base:
         return None
     if quote and quote.upper() not in STABLE_QUOTES:
-        # non-stable quote: показываем полную пару (BIRBKRW, ETHBTC)
+        # non-stable quote: РїРѕРєР°Р·С‹РІР°РµРј РїРѕР»РЅСѓСЋ РїР°СЂСѓ (BIRBKRW, ETHBTC)
         return f"{base.upper()}{quote.upper()}"
-    # stable quote или quote отсутствует: показываем токен (VZON)
+    # stable quote РёР»Рё quote РѕС‚СЃСѓС‚СЃС‚РІСѓРµС‚: РїРѕРєР°Р·С‹РІР°РµРј С‚РѕРєРµРЅ (VZON)
     return base.upper()
 
 
@@ -146,7 +146,7 @@ def extract(text: str) -> dict:
     # exchange
     if not exchange:
         for ex in EXCHANGES:
-            if re.search(rf"\b{re.escape(ex)}\b", t):
+            if re.search(rf"\b{re.escape(ex)}\b", t, re.IGNORECASE):
                 exchange = ex
                 break
         # --- special: Aster (domain/keywords) ---
@@ -157,7 +157,7 @@ def extract(text: str) -> dict:
     # market type
     market_type = None
 
-    # приоритетные маркеры (F)/(S)
+    # РїСЂРёРѕСЂРёС‚РµС‚РЅС‹Рµ РјР°СЂРєРµСЂС‹ (F)/(S)
     if re.search(r"\(\s*f\s*\)", t) or re.search(r"\[\s*f\s*\]", t):
         market_type = "futures"
     elif re.search(r"\(\s*s\s*\)", t) or re.search(r"\[\s*s\s*\]", t):
@@ -170,14 +170,16 @@ def extract(text: str) -> dict:
             market_type = "futures"
         elif "spot" in t:
             market_type = "spot"
-        # --- fallback: market_type по ссылкам (если словами не нашли) ---
+        elif re.search(r"\bpre(?:\s|[-\u2010-\u2015])*market\b", t):
+            market_type = "futures"
+        # --- fallback: market_type РїРѕ СЃСЃС‹Р»РєР°Рј (РµСЃР»Рё СЃР»РѕРІР°РјРё РЅРµ РЅР°С€Р»Рё) ---
     base = None
     quote = None
-    # Binance Alpha чаще всего означает спот-листинг
+    # Binance Alpha С‡Р°С‰Рµ РІСЃРµРіРѕ РѕР·РЅР°С‡Р°РµС‚ СЃРїРѕС‚-Р»РёСЃС‚РёРЅРі
     if exchange == "Binance Alpha" and market_type is None:
         market_type = "spot"
 
-    # 1) Futures "XPD" — токен в кавычках
+    # 1) Futures "XPD" вЂ” С‚РѕРєРµРЅ РІ РєР°РІС‹С‡РєР°С…
     m = re.search(
         r'\b(?:futures|perps?)\b\s*["“”]([A-Za-z0-9]{2,20})["“”]', raw, re.IGNORECASE
     )
@@ -190,7 +192,13 @@ def extract(text: str) -> dict:
         if m:
             base = m.group(1).upper()
 
-    # 3) BASE/QUOTE или BASE-QUOTE или BASE_QUOTE
+    # 2.1) #XPD
+    if not base:
+        m = re.search(r"#([A-Z0-9]{2,20})\b", raw, re.IGNORECASE)
+        if m:
+            base = m.group(1).upper()
+
+    # 3) BASE/QUOTE РёР»Рё BASE-QUOTE РёР»Рё BASE_QUOTE
     if not base:
         m = re.search(r"\b([A-Z0-9]{2,20})\s*[/\-_]\s*([A-Z]{2,6})\b", raw)
         if m:
@@ -199,10 +207,10 @@ def extract(text: str) -> dict:
             if q in QUOTES:
                 base, quote = b, q
             else:
-                # если вторая часть не похожа на quote — считаем это просто base
+                # РµСЃР»Рё РІС‚РѕСЂР°СЏ С‡Р°СЃС‚СЊ РЅРµ РїРѕС…РѕР¶Р° РЅР° quote вЂ” СЃС‡РёС‚Р°РµРј СЌС‚Рѕ РїСЂРѕСЃС‚Рѕ base
                 base = b
 
-    # 4) Слитно BASEQUOTE (BTCUSDT, BIRBKRW, ETHBTC)
+    # 4) РЎР»РёС‚РЅРѕ BASEQUOTE (BTCUSDT, BIRBKRW, ETHBTC)
     if not base:
         m = re.search(
             r"\b([A-Z0-9]{2,20})(USDT|USDC|USD|KRW|BTC|ETH|EUR|GBP|JPY)\b",
@@ -213,11 +221,18 @@ def extract(text: str) -> dict:
             base = m.group(1).upper()
             quote = m.group(2).upper()
 
-    # 5) просто "XPD" в кавычках как запасной вариант
+    # 5) РїСЂРѕСЃС‚Рѕ "XPD" РІ РєР°РІС‹С‡РєР°С… РєР°Рє Р·Р°РїР°СЃРЅРѕР№ РІР°СЂРёР°РЅС‚
     if not base:
         m = re.search(r'["“”]([A-Za-z0-9]{2,20})["“”]', raw)
         if m:
             base = m.group(1).upper()
+
+    # 6) checklist line: "✅ XCU: Lighter (F)"
+    if not base:
+        m = re.search(r"^[^\S\r\n]*[✅✔☑]\s*([A-Za-z0-9/_-]{2,40})\s*:", raw, re.MULTILINE)
+        if m:
+            b, q, _ = _parse_symbol_from_checkline(m.group(1).strip())
+            base, quote = b, q
 
     display = _display_symbol(base, quote)
 
@@ -230,15 +245,15 @@ def extract(text: str) -> dict:
     return {
         "exchange": exchange,
         "market_type": market_type,
-        "base": base,  # токен (или base пары)
-        "quote": quote,  # котировка (USDT/KRW/BTC/...)
-        "display": display,  # как показывать пользователю
+        "base": base,  # С‚РѕРєРµРЅ (РёР»Рё base РїР°СЂС‹)
+        "quote": quote,  # РєРѕС‚РёСЂРѕРІРєР° (USDT/KRW/BTC/...)
+        "display": display,  # РєР°Рє РїРѕРєР°Р·С‹РІР°С‚СЊ РїРѕР»СЊР·РѕРІР°С‚РµР»СЋ
         "confidence": conf,
     }
 
 
 CHECKLINE_RE = re.compile(
-    r"^[^\S\r\n]*✅\s*([A-Za-z0-9/_-]{2,40})\s*:\s*(.+)$",
+    r"^[^\S\r\n]*(?:\u2705|\u2714|\u2611)\s*([A-Za-z0-9/_-]{2,40})\s*:\s*(.+)$",
     re.MULTILINE,
 )
 
@@ -251,7 +266,7 @@ EX_IN_LIST_RE = re.compile(
 def _parse_symbol_from_checkline(sym_raw: str):
     sym_raw = (sym_raw or "").strip()
 
-    # BASE/QUOTE или BASE-QUOTE или BASE_QUOTE
+    # BASE/QUOTE РёР»Рё BASE-QUOTE РёР»Рё BASE_QUOTE
     m = re.search(
         r"\b([A-Z0-9]{2,20})\s*[/\-_]\s*([A-Z]{2,6})\b", sym_raw, re.IGNORECASE
     )
@@ -262,7 +277,7 @@ def _parse_symbol_from_checkline(sym_raw: str):
             return b, q, _display_symbol(b, q)
         return b, None, _display_symbol(b, None)
 
-    # Слитно BASEQUOTE (BTCUSDT, BIRBKRW, ETHBTC)
+    # РЎР»РёС‚РЅРѕ BASEQUOTE (BTCUSDT, BIRBKRW, ETHBTC)
     m = re.search(
         r"\b([A-Z0-9]{2,20})(USDT|USDC|USD|KRW|BTC|ETH|EUR|GBP|JPY)\b",
         sym_raw,
@@ -273,14 +288,14 @@ def _parse_symbol_from_checkline(sym_raw: str):
         q = m.group(2).upper()
         return b, q, _display_symbol(b, q)
 
-    # иначе берём целиком как base (универсально)
+    # РёРЅР°С‡Рµ Р±РµСЂС‘Рј С†РµР»РёРєРѕРј РєР°Рє base (СѓРЅРёРІРµСЂСЃР°Р»СЊРЅРѕ)
     b = re.sub(r"[^A-Za-z0-9]", "", sym_raw).upper()
     return (b if b else None), None, _display_symbol(b if b else None, None)
 
 
 def extract_many(text: str) -> list[dict]:
     """
-    Возвращает список токенов в одном сообщении metascalp-формата.
+    Р’РѕР·РІСЂР°С‰Р°РµС‚ СЃРїРёСЃРѕРє С‚РѕРєРµРЅРѕРІ РІ РѕРґРЅРѕРј СЃРѕРѕР±С‰РµРЅРёРё metascalp-С„РѕСЂРјР°С‚Р°.
     [
       {base, quote, display, futures_exchanges:[...], spot_exchanges:[...]},
       ...
@@ -306,8 +321,8 @@ def extract_many(text: str) -> list[dict]:
             ex = (ex_name or "").strip()
             tag = (tag or "").upper()
 
-            # чистим хвосты типа "1️⃣"
-            ex = re.sub(r"\s*\d+️⃣$", "", ex).strip()
+            # С‡РёСЃС‚РёРј С…РІРѕСЃС‚С‹ С‚РёРїР° "1пёЏвѓЈ"
+            ex = re.sub(r"\s*\d+\ufe0f\u20e3$", "", ex).strip()
 
             if tag == "F":
                 fut.append(ex)

@@ -2,7 +2,7 @@ CHANNELS = [
     "metascalp_announcements_ru",
     "listing_alarm",
     "rickler_alerts",
-    "NewListingsFeed",
+    "newlistingsfeed",
     "mexc_futures",
     "AsterDexListings",
     "coin_listing",
