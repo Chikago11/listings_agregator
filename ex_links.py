@@ -1,13 +1,12 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import re
 from urllib.parse import urlparse
-from urllib.parse import quote as url_quote
 
-# Нормализуем названия бирж (чтобы "🔵MEXC", "MEXC", "mexc" -> "mexc")
+# РќРѕСЂРјР°Р»РёР·СѓРµРј РЅР°Р·РІР°РЅРёСЏ Р±РёСЂР¶ (С‡С‚РѕР±С‹ "рџ”µMEXC", "MEXC", "mexc" -> "mexc")
 def norm_ex(ex: str) -> str:
     ex = (ex or "").strip()
-    ex = re.sub(r"^[^\w]+", "", ex)  # убираем эмодзи/символы в начале
+    ex = re.sub(r"^[^\w]+", "", ex)  # СѓР±РёСЂР°РµРј СЌРјРѕРґР·Рё/СЃРёРјРІРѕР»С‹ РІ РЅР°С‡Р°Р»Рµ
     ex = ex.strip().lower()
     ex = ex.replace("kucoin", "kucoin")
     ex = ex.replace("bitmart", "bitmart")
@@ -30,7 +29,7 @@ def sym_dash_lower(base: str, quote: str) -> str:
     return f"{base}-{quote}".lower()
 
 def sym_okx_spot(base: str, quote: str) -> str:
-    # okx spot обычно lower: eth-usdt
+    # okx spot РѕР±С‹С‡РЅРѕ lower: eth-usdt
     return f"{base}-{quote}".lower()
 
 def sym_okx_swap(base: str, quote: str) -> str:
@@ -79,7 +78,7 @@ def build_exchange_link(exchange: str, market_type: str, base: str, quote: str =
             # https://www.binance.com/ru/futures/UAIUSDT
             return f"https://www.binance.com/ru/futures/{sym_usdt_concat(base, quote)}"
         if mt == "spot":
-            # пример у тебя: /trade/USDC_USDT?type=spot
+            # РїСЂРёРјРµСЂ Сѓ С‚РµР±СЏ: /trade/USDC_USDT?type=spot
             return f"https://www.binance.com/ru/trade/{sym_usdt_underscore(base, quote)}?type=spot"
 
     # -------- KCEX --------
@@ -88,9 +87,9 @@ def build_exchange_link(exchange: str, market_type: str, base: str, quote: str =
             # https://www.kcex.com/ru-RU/exchange/BTC_USDT
             return f"https://www.kcex.com/ru-RU/exchange/{sym_usdt_underscore(base, quote)}"
         if mt == "futures":
-            # У KCEX фьючи не прямой символьный URL как у mexc/gate, чаще через страницу exchange.
-            # Делаем “best effort”: search через параметр symbol, если сработает.
-            # Если нет — хотя бы откроется фьюч-раздел.
+            # РЈ KCEX С„СЊСЋС‡Рё РЅРµ РїСЂСЏРјРѕР№ СЃРёРјРІРѕР»СЊРЅС‹Р№ URL РєР°Рє Сѓ mexc/gate, С‡Р°С‰Рµ С‡РµСЂРµР· СЃС‚СЂР°РЅРёС†Сѓ exchange.
+            # Р”РµР»Р°РµРј вЂњbest effortвЂќ: search С‡РµСЂРµР· РїР°СЂР°РјРµС‚СЂ symbol, РµСЃР»Рё СЃСЂР°Р±РѕС‚Р°РµС‚.
+            # Р•СЃР»Рё РЅРµС‚ вЂ” С…РѕС‚СЏ Р±С‹ РѕС‚РєСЂРѕРµС‚СЃСЏ С„СЊСЋС‡-СЂР°Р·РґРµР».
             return f"https://www.kcex.com/ru-RU/futures/exchange?type=linear_swap&symbol={sym_usdt_underscore(base, quote)}"
 
     # -------- Bitget --------
@@ -108,9 +107,9 @@ def build_exchange_link(exchange: str, market_type: str, base: str, quote: str =
             # https://www.kucoin.com/ru/trade/BYTE-USDT
             return f"https://www.kucoin.com/ru/trade/{sym_dash(base, quote)}"
         if mt == "futures":
-            # У KuCoin фьючи часто имеют суффикс M / MM (XBTUSDTM / XBTUSDTMM).
-            # Для универсальности ведём на futures поиск по тикеру (часто открывается нужная карточка).
-            # Если у тебя появится точный формат для всех — заменим.
+            # РЈ KuCoin С„СЊСЋС‡Рё С‡Р°СЃС‚Рѕ РёРјРµСЋС‚ СЃСѓС„С„РёРєСЃ M / MM (XBTUSDTM / XBTUSDTMM).
+            # Р”Р»СЏ СѓРЅРёРІРµСЂСЃР°Р»СЊРЅРѕСЃС‚Рё РІРµРґС‘Рј РЅР° futures РїРѕРёСЃРє РїРѕ С‚РёРєРµСЂСѓ (С‡Р°СЃС‚Рѕ РѕС‚РєСЂС‹РІР°РµС‚СЃСЏ РЅСѓР¶РЅР°СЏ РєР°СЂС‚РѕС‡РєР°).
+            # Р•СЃР»Рё Сѓ С‚РµР±СЏ РїРѕСЏРІРёС‚СЃСЏ С‚РѕС‡РЅС‹Р№ С„РѕСЂРјР°С‚ РґР»СЏ РІСЃРµС… вЂ” Р·Р°РјРµРЅРёРј.
             return f"https://www.kucoin.com/ru/trade/futures/{sym_usdt_concat(base, quote)}M"
 
     # -------- BingX --------
@@ -128,9 +127,18 @@ def build_exchange_link(exchange: str, market_type: str, base: str, quote: str =
             # https://www.weex.com/spot/BTC-USDT
             return f"https://www.weex.com/spot/{sym_dash(base, quote)}"
         if mt == "futures":
-            # У WEEX фьючи часто по id (не по символу). Универсального символьного URL нет.
-            # Делаем полезный fallback: фьюч-раздел + поиск по символу в query.
-            return f"https://www.weex.com/futures?symbol={url_quote(sym_dash(base, quote))}"
+            # РЈ WEEX С„СЊСЋС‡Рё С‡Р°СЃС‚Рѕ РїРѕ id (РЅРµ РїРѕ СЃРёРјРІРѕР»Сѓ). РЈРЅРёРІРµСЂСЃР°Р»СЊРЅРѕРіРѕ СЃРёРјРІРѕР»СЊРЅРѕРіРѕ URL РЅРµС‚.
+            # Р”РµР»Р°РµРј РїРѕР»РµР·РЅС‹Р№ fallback: С„СЊСЋС‡-СЂР°Р·РґРµР» + РїРѕРёСЃРє РїРѕ СЃРёРјРІРѕР»Сѓ РІ query.
+            return f"https://www.weex.com/futures/{sym_dash(base, quote)}"
+
+    # -------- LBank --------
+    if ex == "lbank":
+        if mt == "spot":
+            # https://www.lbank.com/trade/eth_usdt
+            return f"https://www.lbank.com/trade/{base.lower()}_{quote.lower()}"
+        if mt == "futures":
+            # https://www.lbank.com/futures/ethusdt
+            return f"https://www.lbank.com/futures/{base.lower()}{quote.lower()}"
 
     # -------- OKX --------
     if ex == "okx":
@@ -144,7 +152,7 @@ def build_exchange_link(exchange: str, market_type: str, base: str, quote: str =
     # -------- Bybit --------
     if ex == "bybit":
         if mt == "spot":
-            # У Bybit spot формат чаще /trade/spot/BTC/USDC, но для универсальности лучше вести на поиск.
+            # РЈ Bybit spot С„РѕСЂРјР°С‚ С‡Р°С‰Рµ /trade/spot/BTC/USDC, РЅРѕ РґР»СЏ СѓРЅРёРІРµСЂСЃР°Р»СЊРЅРѕСЃС‚Рё Р»СѓС‡С€Рµ РІРµСЃС‚Рё РЅР° РїРѕРёСЃРє.
             return f"https://www.bybit.com/en/trade/spot/{base}/{quote}"
         if mt == "futures":
             # https://www.bybit.com/trade/usdt/RIVERUSDT
@@ -153,8 +161,8 @@ def build_exchange_link(exchange: str, market_type: str, base: str, quote: str =
     # -------- CoinEx --------
     if ex == "coinex":
         if mt == "spot":
-            # У CoinEx spot формат бывает через exchange#spot, а конкретная пара часто параметрами/роутом.
-            # Даем универсальный “поисковый” вид через market=... (работает на futures, spot может редиректить).
+            # РЈ CoinEx spot С„РѕСЂРјР°С‚ Р±С‹РІР°РµС‚ С‡РµСЂРµР· exchange#spot, Р° РєРѕРЅРєСЂРµС‚РЅР°СЏ РїР°СЂР° С‡Р°СЃС‚Рѕ РїР°СЂР°РјРµС‚СЂР°РјРё/СЂРѕСѓС‚РѕРј.
+            # Р”Р°РµРј СѓРЅРёРІРµСЂСЃР°Р»СЊРЅС‹Р№ вЂњРїРѕРёСЃРєРѕРІС‹Р№вЂќ РІРёРґ С‡РµСЂРµР· market=... (СЂР°Р±РѕС‚Р°РµС‚ РЅР° futures, spot РјРѕР¶РµС‚ СЂРµРґРёСЂРµРєС‚РёС‚СЊ).
             return f"https://www.coinex.com/en/exchange/{sym_usdt_underscore(base, quote)}"
         if mt == "futures":
             # https://www.coinex.com/en/futures/pippin-usdt  (lower + dash)
@@ -182,10 +190,16 @@ def build_exchange_link(exchange: str, market_type: str, base: str, quote: str =
             # https://www.bitmart.com/ru-RU/trade/BTC_USDT?type=spot
             return f"https://www.bitmart.com/ru-RU/trade/{sym_usdt_underscore(base, quote)}?type=spot"
         if mt == "futures":
-            # У Bitmart derivatives часто не прямой тикер в url. Дадим полезный fallback на фьюч-раздел.
+            # РЈ Bitmart derivatives С‡Р°СЃС‚Рѕ РЅРµ РїСЂСЏРјРѕР№ С‚РёРєРµСЂ РІ url. Р”Р°РґРёРј РїРѕР»РµР·РЅС‹Р№ fallback РЅР° С„СЊСЋС‡-СЂР°Р·РґРµР».
             return "https://derivatives.bitmart.com/ru-RU/futures"
 
-    # --- PERP / DEX list fallback (если в CSV попадёт такой exchange) ---
+    # -------- Aster --------
+    if ex == "aster":
+        if mt == "futures":
+            # https://www.asterdex.com/en/trade/pro/futures/OPNUSDT
+            return f"https://www.asterdex.com/en/trade/pro/futures/{sym_usdt_concat(base, quote)}"
+        return "https://www.asterdex.com/en/trade/pro/futures"
+    # --- PERP / DEX list fallback (РµСЃР»Рё РІ CSV РїРѕРїР°РґС‘С‚ С‚Р°РєРѕР№ exchange) ---
     PERP_EXCHANGES = {
         "edgex": "https://www.edgex.exchange/",
         "elfi": "https://elfi.xyz/",
@@ -303,6 +317,12 @@ def infer_market_type_from_url(url: str) -> str | None:
         if "/trade/" in path:
             return "spot"
 
+    if "lbank.com" in host:
+        if "/futures/" in path:
+            return "futures"
+        if "/trade/" in path:
+            return "spot"
+
     # Generic fallback (less precise)
     if any(x in path for x in ("/futures/", "/perpetual/", "/contract/", "/derivatives/")):
         return "futures"
@@ -310,3 +330,5 @@ def infer_market_type_from_url(url: str) -> str | None:
         return "spot"
 
     return None
+
+

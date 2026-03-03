@@ -1,6 +1,8 @@
 import asyncio
 import hashlib
 import re
+import traceback
+from datetime import datetime, timezone
 from telethon import TelegramClient, events
 from telethon.extensions import html
 from telethon.tl.functions.channels import JoinChannelRequest
@@ -14,12 +16,16 @@ from config import (
     SESSION_NAME,
     DEDUP_TEXT_TTL_SEC,
     DEDUP_STRUCT_TTL_SEC,
+    MAX_EDIT_MESSAGE_AGE_SEC,
+    OLD_EDIT_BYPASS_CHANNELS,
+    POSTS_LOG_PATH,
 )
 from channels import CHANNELS
 from db import init_db, is_seen, mark_seen, gc
 from parser import normalize_text, extract  # extract_many если подключишь позже
 from sender import send_alert
 from ex_links import build_exchange_link
+from post_log import append_post_log
 
 
 def msg_url(channel_username: str, message_id: int) -> str:
@@ -76,6 +82,36 @@ def extract_hidden_urls(body_html: str) -> list[str]:
     return out
 
 
+def shorten_for_html(body_html: str, parse_text: str, limit: int = 3000) -> str:
+    if len(body_html) <= limit:
+        return body_html
+    # Avoid broken HTML by truncating escaped plain text fallback.
+    flat = " ".join((parse_text or "").split())
+    if not flat:
+        return body_html[: max(0, limit - 1)] + "…"
+    clipped = flat[: max(0, limit - 1)].rstrip()
+    return html.escape(clipped) + "…"
+
+
+def log_post_event(
+    *,
+    source: str,
+    original_post: str,
+    status: str,
+    post_for_user: str = "",
+) -> None:
+    try:
+        append_post_log(
+            log_path=POSTS_LOG_PATH,
+            source=source,
+            original_post=original_post,
+            status=status,
+            post_for_user=post_for_user,
+        )
+    except Exception as e:
+        print("Post log error:", repr(e))
+
+
 async def join_channels(client: TelegramClient):
     for ch in CHANNELS:
         try:
@@ -96,15 +132,38 @@ async def run():
         async def handler(event):
             try:
                 ch = getattr(event.chat, "username", None)
+                source_tag = f"@{ch}" if ch else str(getattr(event, "chat_id", "unknown"))
 
                 msg_id = event.message.id
+
+                # Old posts in listing channels are sometimes edited days later.
+                # We keep fresh edits (useful for placeholder/reserved posts) but
+                # ignore edits of old messages to prevent duplicate alerts.
+                edit_date = getattr(event.message, "edit_date", None)
+                msg_date = getattr(event.message, "date", None)
+                ch_norm = (ch or "").lstrip("@").lower()
+                bypass_old_edit_age = ch_norm in OLD_EDIT_BYPASS_CHANNELS
+                if edit_date and msg_date and MAX_EDIT_MESSAGE_AGE_SEC > 0 and not bypass_old_edit_age:
+                    try:
+                        if msg_date.tzinfo is None:
+                            msg_date = msg_date.replace(tzinfo=timezone.utc)
+                        age_sec = (datetime.now(timezone.utc) - msg_date.astimezone(timezone.utc)).total_seconds()
+                        if age_sec > MAX_EDIT_MESSAGE_AGE_SEC:
+                            print(
+                                f"Skip old edit: source={source_tag} msg_id={msg_id} age_sec={int(age_sec)}"
+                            )
+                            log_post_event(
+                                source=str(source_tag),
+                                original_post=(event.message.message or event.message.raw_text or "").strip(),
+                                status="пропуск: старый edit",
+                            )
+                            return
+                    except Exception as e:
+                        print("Edit age check error:", repr(e))
 
                 raw_text = event.message.message or event.message.raw_text or ""
                 preview_text = build_preview_text(event.message)
                 parse_text = raw_text if not preview_text else f"{raw_text}\n{preview_text}"
-
-                if not parse_text.strip():
-                    return
 
                 # body_html сохраняет "вшитые" ссылки
                 entities = event.message.entities or []
@@ -118,6 +177,12 @@ async def run():
                 if hidden_urls:
                     parse_text = f"{parse_text}\n" + "\n".join(hidden_urls)
 
+                original_post = (raw_text or "").strip() or (parse_text or "").strip()
+
+                if not parse_text.strip():
+                    print(f"Skip empty message: source={source_tag} msg_id={msg_id}")
+                    return
+
                 if not body_html:
                     body_html = html.escape(parse_text).replace("\n", "<br>")
 
@@ -130,8 +195,16 @@ async def run():
                     norm = " ".join(parse_text.split()).lower()
                 if not norm:
                     return
-                text_key = "t:" + sha256(norm)
+                # Keep text dedup per source channel so mirrored posts from
+                # another feed do not fully suppress this source.
+                text_key = f"t:{source_tag}:" + sha256(norm)
                 if await is_seen(text_key):
+                    print(f"Skip text dedup: source={source_tag} msg_id={msg_id}")
+                    log_post_event(
+                        source=str(source_tag),
+                        original_post=original_post,
+                        status="дубликат",
+                    )
                     return
 
                 meta = extract(parse_text)
@@ -155,7 +228,13 @@ async def run():
                     sym_key = meta.get("display") or meta.get("base") or ""
                     k = f"s:{meta.get('exchange')}:{meta.get('market_type')}:{sym_key}"
                     if await is_seen(k):
+                        print(f"Skip struct dedup: source={source_tag} msg_id={msg_id} key={k}")
                         await mark_seen(text_key, DEDUP_TEXT_TTL_SEC)
+                        log_post_event(
+                            source=str(source_tag),
+                            original_post=original_post,
+                            status="дубликат",
+                        )
                         return
                     await mark_seen(k, DEDUP_STRUCT_TTL_SEC)
 
@@ -196,19 +275,25 @@ async def run():
                 else:
                     src_line = f"{source_emoji} <b>Источник:</b> {html.escape(str(src_title))}"
 
-                if len(body_html) > 3000:
-                    body_html = body_html[:3000] + "…"
+                body_html = shorten_for_html(body_html, parse_text, limit=3000)
 
                 alert_html = f"{line1}\n{src_line}\n\n{body_html}"
 
                 # шлём без кнопок
                 await send_alert(alert_html, parse_mode="HTML")
+                log_post_event(
+                    source=str(src_title),
+                    original_post=original_post,
+                    status="отправлен пользователю",
+                    post_for_user=alert_html,
+                )
 
                 # помечаем текст как увиденный
                 await mark_seen(text_key, DEDUP_TEXT_TTL_SEC)
 
             except Exception as e:
                 print("Handler error:", repr(e))
+                traceback.print_exc()
 
         async def gc_loop():
             while True:

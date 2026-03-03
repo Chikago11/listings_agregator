@@ -15,6 +15,7 @@ EXCHANGES = {
     "coinbase",
     "kraken",
     "upbit",
+    "bithumb",
     "htx",
     "bitfinex",
     "bitmart",
@@ -25,6 +26,8 @@ EXCHANGES = {
     "Binance Alpha",
     "CryptoCom",
     "Lighter",
+    "weex",
+    "lbank",
 }
 
 # С‡С‚Рѕ СЃС‡РёС‚Р°РµРј "РєРѕС‚РёСЂРѕРІРєРѕР№" (quote)
@@ -181,26 +184,26 @@ def extract(text: str) -> dict:
 
     # 1) Futures "XPD" вЂ” С‚РѕРєРµРЅ РІ РєР°РІС‹С‡РєР°С…
     m = re.search(
-        r'\b(?:futures|perps?)\b\s*["“”]([A-Za-z0-9]{2,20})["“”]', raw, re.IGNORECASE
+        r'\b(?:futures|perps?)\b\s*["“”]([A-Za-z0-9]{1,20})["“”]', raw, re.IGNORECASE
     )
     if m:
         base = m.group(1).upper()
 
     # 2) $XPD
     if not base:
-        m = re.search(r"\$([A-Z0-9]{2,20})\b", raw)
+        m = re.search(r"\$([A-Z0-9]{1,20})\b", raw)
         if m:
             base = m.group(1).upper()
 
     # 2.1) #XPD
     if not base:
-        m = re.search(r"#([A-Z0-9]{2,20})\b", raw, re.IGNORECASE)
+        m = re.search(r"#([A-Z0-9]{1,20})\b", raw, re.IGNORECASE)
         if m:
             base = m.group(1).upper()
 
     # 3) BASE/QUOTE РёР»Рё BASE-QUOTE РёР»Рё BASE_QUOTE
     if not base:
-        m = re.search(r"\b([A-Z0-9]{2,20})\s*[/\-_]\s*([A-Z]{2,6})\b", raw)
+        m = re.search(r"\b([A-Z0-9]{1,20})\s*[/\-_]\s*([A-Z]{2,6})\b", raw)
         if m:
             b = m.group(1).upper()
             q = m.group(2).upper()
@@ -213,7 +216,7 @@ def extract(text: str) -> dict:
     # 4) РЎР»РёС‚РЅРѕ BASEQUOTE (BTCUSDT, BIRBKRW, ETHBTC)
     if not base:
         m = re.search(
-            r"\b([A-Z0-9]{2,20})(USDT|USDC|USD|KRW|BTC|ETH|EUR|GBP|JPY)\b",
+            r"\b([A-Z0-9]{1,20})(USDT|USDC|USD|KRW|BTC|ETH|EUR|GBP|JPY)\b",
             raw,
             re.IGNORECASE,
         )
@@ -223,16 +226,32 @@ def extract(text: str) -> dict:
 
     # 5) РїСЂРѕСЃС‚Рѕ "XPD" РІ РєР°РІС‹С‡РєР°С… РєР°Рє Р·Р°РїР°СЃРЅРѕР№ РІР°СЂРёР°РЅС‚
     if not base:
-        m = re.search(r'["“”]([A-Za-z0-9]{2,20})["“”]', raw)
+        m = re.search(r'["“”]([A-Za-z0-9]{1,20})["“”]', raw)
+        if m:
+            base = m.group(1).upper()
+
+    # 5.1) Token in parentheses: "Tria (TRIA) to spot..."
+    if not base:
+        m = re.search(r"\(([A-Za-z0-9]{1,20})\)", raw)
+        if m:
+            base = m.group(1).upper()
+
+    # 5.2) "BIRB listed on Upbit ..."
+    if not base:
+        m = re.search(r"\b([A-Za-z0-9]{1,20})\s+listed\s+on\b", raw, re.IGNORECASE)
         if m:
             base = m.group(1).upper()
 
     # 6) checklist line: "✅ XCU: Lighter (F)"
     if not base:
-        m = re.search(r"^[^\S\r\n]*[✅✔☑]\s*([A-Za-z0-9/_-]{2,40})\s*:", raw, re.MULTILINE)
+        m = re.search(r"^[^\S\r\n]*[✅✔☑]\s*([A-Za-z0-9/_-]{1,40})\s*:", raw, re.MULTILINE)
         if m:
             b, q, _ = _parse_symbol_from_checkline(m.group(1).strip())
             base, quote = b, q
+
+    # 7) Listing-like wording without explicit market type usually means spot.
+    if market_type is None and re.search(r"\blisted\s+on\b|\bwill\s+list\b|\bto\s+list\b|\broadmap\b", t):
+        market_type = "spot"
 
     display = _display_symbol(base, quote)
 
@@ -253,7 +272,7 @@ def extract(text: str) -> dict:
 
 
 CHECKLINE_RE = re.compile(
-    r"^[^\S\r\n]*(?:\u2705|\u2714|\u2611)\s*([A-Za-z0-9/_-]{2,40})\s*:\s*(.+)$",
+    r"^[^\S\r\n]*(?:\u2705|\u2714|\u2611)\s*([A-Za-z0-9/_-]{1,40})\s*:\s*(.+)$",
     re.MULTILINE,
 )
 
@@ -268,7 +287,7 @@ def _parse_symbol_from_checkline(sym_raw: str):
 
     # BASE/QUOTE РёР»Рё BASE-QUOTE РёР»Рё BASE_QUOTE
     m = re.search(
-        r"\b([A-Z0-9]{2,20})\s*[/\-_]\s*([A-Z]{2,6})\b", sym_raw, re.IGNORECASE
+        r"\b([A-Z0-9]{1,20})\s*[/\-_]\s*([A-Z]{2,6})\b", sym_raw, re.IGNORECASE
     )
     if m:
         b = m.group(1).upper()
@@ -279,7 +298,7 @@ def _parse_symbol_from_checkline(sym_raw: str):
 
     # РЎР»РёС‚РЅРѕ BASEQUOTE (BTCUSDT, BIRBKRW, ETHBTC)
     m = re.search(
-        r"\b([A-Z0-9]{2,20})(USDT|USDC|USD|KRW|BTC|ETH|EUR|GBP|JPY)\b",
+        r"\b([A-Z0-9]{1,20})(USDT|USDC|USD|KRW|BTC|ETH|EUR|GBP|JPY)\b",
         sym_raw,
         re.IGNORECASE,
     )
