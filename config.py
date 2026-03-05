@@ -25,6 +25,19 @@ OLD_EDIT_BYPASS_CHANNELS = {
     if item.strip()
 }
 
+# --- Message identity dedup ---
+MESSAGE_SEEN_TTL_SEC = int(os.environ.get("MESSAGE_SEEN_TTL_SEC", "604800"))
+
+# --- Backfill ---
+BACKFILL_CHANNELS = [
+    item.strip().lstrip("@")
+    for item in os.environ.get("BACKFILL_CHANNELS", "newlistingsfeed").split(",")
+    if item.strip()
+]
+BACKFILL_LIMIT = int(os.environ.get("BACKFILL_LIMIT", "80"))
+BACKFILL_INTERVAL_SEC = int(os.environ.get("BACKFILL_INTERVAL_SEC", "120"))
+BACKFILL_MAX_AGE_SEC = int(os.environ.get("BACKFILL_MAX_AGE_SEC", "172800"))
+
 # --- Limits ---
 MAX_SOURCE_LINKS = 5
 SEND_DELAY_SEC = 0.05
