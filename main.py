@@ -24,6 +24,7 @@ from config import (
     BACKFILL_INTERVAL_SEC,
     BACKFILL_MAX_AGE_SEC,
     POSTS_LOG_PATH,
+    TOKEN_TTL_DAYS,
 )
 from channels import CHANNELS
 from db import init_db, is_seen, mark_seen, gc
@@ -243,20 +244,6 @@ async def run():
 
             meta = extract(parse_text)
 
-            # --- CSV store ---
-            token = meta.get("base")
-            exchange = meta.get("exchange")
-            mtype = meta.get("market_type")
-            if token and exchange and mtype:
-                try:
-                    upsert_listing(
-                        token=token,
-                        market_type=mtype,
-                        exchange=exchange.strip(),
-                    )
-                except Exception as e:
-                    print("CSV store error:", repr(e))
-
             # --- structured dedup ---
             if meta.get("base") and meta.get("exchange") and meta.get("market_type"):
                 sym_key = meta.get("display") or meta.get("base") or ""
@@ -318,6 +305,16 @@ async def run():
                 status="sent",
                 post_for_user=alert_html,
             )
+            # Keep token state in sync with what was actually sent by the bot.
+            if base and ex_name and mt_raw in ("spot", "futures"):
+                try:
+                    upsert_listing(
+                        token=base,
+                        market_type=mt_raw,
+                        exchange=ex_name,
+                    )
+                except Exception as e:
+                    print("CSV store error:", repr(e))
 
             # Mark as processed by text and by message-version identity.
             await mark_seen(text_key, DEDUP_TEXT_TTL_SEC)
@@ -375,7 +372,7 @@ async def run():
         async def gc_loop():
             while True:
                 try:
-                    removed = purge_old_tokens(days=7)
+                    removed = purge_old_tokens(days=TOKEN_TTL_DAYS)
                     if removed:
                         print(f"purge_old_tokens: removed={removed}")
                 except Exception as e:

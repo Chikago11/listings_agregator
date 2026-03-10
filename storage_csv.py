@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
 TOKENS_CSV_PATH = os.getenv("TOKENS_CSV_PATH", "tokens.csv")
-CSV_FIELDS = ["token", "created_at", "futures", "spot"]
+CSV_FIELDS = ["token", "created_at", "last_post_at", "futures", "spot"]
 
 
 def _now_iso() -> str:
@@ -26,6 +26,10 @@ def read_all_rows() -> List[Dict[str, str]]:
             # нормализуем ключи
             row = {k.strip(): (v.strip() if isinstance(v, str) else "") for k, v in r.items()}
             if row.get("token"):
+                row.setdefault("created_at", "")
+                row.setdefault("last_post_at", "")
+                row.setdefault("futures", "")
+                row.setdefault("spot", "")
                 rows.append(row)
     return rows
 
@@ -48,9 +52,12 @@ def _parse_dt(s: str) -> datetime:
 
 
 def get_tokens_sorted() -> List[str]:
-    """Токены от новых к старым по created_at."""
+    """Токены от новых к старым по last_post_at (fallback: created_at)."""
     rows = read_all_rows()
-    rows.sort(key=lambda r: _parse_dt(r.get("created_at", "")), reverse=True)
+    rows.sort(
+        key=lambda r: _parse_dt(r.get("last_post_at", "") or r.get("created_at", "")),
+        reverse=True,
+    )
     return [r["token"] for r in rows if r.get("token")]
 
 
@@ -84,7 +91,12 @@ def _merge_exchange_list(current: str, new_exchange: str) -> str:
     return "/".join(parts)
 
 
-def upsert_listing(token: str, market_type: str, exchange: str) -> None:
+def upsert_listing(
+    token: str,
+    market_type: str,
+    exchange: str,
+    event_at: Optional[str] = None,
+) -> None:
     """
     Добавляет биржу в futures/spot для токена.
     created_at ставим только если токена ещё не было (первое появление).
@@ -92,6 +104,7 @@ def upsert_listing(token: str, market_type: str, exchange: str) -> None:
     token = (token or "").strip().upper()
     market_type = (market_type or "").strip().lower()
     exchange = (exchange or "").strip()
+    event_at = (event_at or "").strip() or _now_iso()
 
     if not token or not market_type or not exchange:
         return
@@ -107,13 +120,20 @@ def upsert_listing(token: str, market_type: str, exchange: str) -> None:
 
     if idx is None:
         # новая строка
-        row = {"token": token, "created_at": _now_iso(), "futures": "", "spot": ""}
+        row = {
+            "token": token,
+            "created_at": event_at,
+            "last_post_at": event_at,
+            "futures": "",
+            "spot": "",
+        }
         rows.append(row)
         idx = len(rows) - 1
 
     # гарантируем created_at
     if not rows[idx].get("created_at"):
-        rows[idx]["created_at"] = _now_iso()
+        rows[idx]["created_at"] = event_at
+    rows[idx]["last_post_at"] = event_at
 
     if market_type in ("futures", "perp", "perps"):
         rows[idx]["futures"] = _merge_exchange_list(rows[idx].get("futures", ""), exchange)
@@ -126,8 +146,8 @@ def upsert_listing(token: str, market_type: str, exchange: str) -> None:
     write_all_rows(rows)
 
 
-def purge_old_tokens(days: int = 7) -> int:
-    """Удаляет токены, чей created_at старше N дней. Возвращает число удалённых."""
+def purge_old_tokens(days: int = 14) -> int:
+    """Удаляет токены, чей last_post_at (fallback: created_at) старше N дней."""
     rows = read_all_rows()
     if not rows:
         return 0
@@ -137,7 +157,7 @@ def purge_old_tokens(days: int = 7) -> int:
     removed = 0
 
     for r in rows:
-        dt = _parse_dt(r.get("created_at", ""))
+        dt = _parse_dt(r.get("last_post_at", "") or r.get("created_at", ""))
         if dt >= cutoff:
             kept.append(r)
         else:

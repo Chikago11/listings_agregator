@@ -44,3 +44,6 @@ SEND_DELAY_SEC = 0.05
 
 # --- Logging ---
 POSTS_LOG_PATH = os.environ.get("POSTS_LOG_PATH", "posts_log.csv")
+
+# --- Token history retention ---
+TOKEN_TTL_DAYS = int(os.environ.get("TOKEN_TTL_DAYS", "14"))
