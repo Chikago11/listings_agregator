@@ -247,6 +247,9 @@ def infer_market_type_from_url(url: str) -> str | None:
     # Ourbit: separate futures subdomain
     if host.startswith("futures.ourbit.com"):
         return "futures"
+    # Some exchanges also use dedicated futures subdomains, e.g. futures.mexc.com/exchange/...
+    if host.startswith("futures."):
+        return "futures"
 
     # Exchange-specific patterns
     if "binance.com" in host:

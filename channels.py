@@ -8,6 +8,7 @@ CHANNELS = [
     "AsterDexListings",
     "coin_listing",
     "gate_list",
+    "gate_fut",
     "bitget_listings",
     "ourbit_listings",
 ]

@@ -132,6 +132,17 @@ def _display_symbol(base: str | None, quote: str | None) -> str | None:
     return base.upper()
 
 
+CHECKLINE_SYMBOL_RE = re.compile(
+    r"^[^\S\r\n]*(?:\u2705|\u2714|\u2611)\s*([^\s:]{1,80})\s*:",
+    re.MULTILINE,
+)
+
+TOKEN_LINE_RE = re.compile(
+    r"(?:^|\n)\s*(?:new\s+token|нов(?:ый|ая)\s+токен|token|токен)\s*[:：]\s*([^\n\r]{1,120})",
+    re.IGNORECASE,
+)
+
+
 def extract(text: str) -> dict:
     raw = text or ""
     t = normalize_text(raw).lower()
@@ -164,6 +175,10 @@ def extract(text: str) -> dict:
     if re.search(r"\(\s*f\s*\)", t) or re.search(r"\[\s*f\s*\]", t):
         market_type = "futures"
     elif re.search(r"\(\s*s\s*\)", t) or re.search(r"\[\s*s\s*\]", t):
+        market_type = "spot"
+    elif re.search(r"(?:futures|фьючерс)\s*/\s*(?:spot|спот)\s*[:：]\s*f\b", raw, re.IGNORECASE):
+        market_type = "futures"
+    elif re.search(r"(?:futures|фьючерс)\s*/\s*(?:spot|спот)\s*[:：]\s*s\b", raw, re.IGNORECASE):
         market_type = "spot"
     else:
         mt_url = _infer_market_type_from_urls(raw)
@@ -201,6 +216,26 @@ def extract(text: str) -> dict:
         if m:
             base = m.group(1).upper()
 
+    # 2.2) checklist line has higher priority than URL symbol fragments.
+    if not base:
+        m = CHECKLINE_SYMBOL_RE.search(raw)
+        if m:
+            b, q, _ = _parse_symbol_from_checkline(m.group(1).strip())
+            base, quote = b, q
+
+    # 2.3) token field like "Новый токен: XXX_USDT" or "токен: XXX"
+    if not base:
+        m = TOKEN_LINE_RE.search(raw)
+        if m:
+            candidate = m.group(1).strip()
+            candidate = re.split(r"\s+", candidate, maxsplit=1)[0]
+            candidate = candidate.strip("`'\"“”[](){}<>.,;:!?")
+            if candidate and not candidate.lower().startswith(("http://", "https://")):
+                b, q, _ = _parse_symbol_from_checkline(candidate)
+                if b:
+                    base = b
+                    quote = quote or q
+
     # 3) BASE/QUOTE РёР»Рё BASE-QUOTE РёР»Рё BASE_QUOTE
     if not base:
         m = re.search(r"\b([A-Z0-9]{1,20})\s*[/\-_]\s*([A-Z]{2,6})\b", raw)
@@ -212,6 +247,19 @@ def extract(text: str) -> dict:
             else:
                 # РµСЃР»Рё РІС‚РѕСЂР°СЏ С‡Р°СЃС‚СЊ РЅРµ РїРѕС…РѕР¶Р° РЅР° quote вЂ” СЃС‡РёС‚Р°РµРј СЌС‚Рѕ РїСЂРѕСЃС‚Рѕ base
                 base = b
+
+    # 3.1) Unicode base + known quote (e.g. 龙虾_USDT)
+    if not base:
+        m = re.search(
+            r"([^\s/:]{1,40})\s*[/\-_]\s*(USDT|USDC|USD|KRW|BTC|ETH|EUR|GBP|JPY)\b",
+            raw,
+            re.IGNORECASE,
+        )
+        if m:
+            b = re.sub(r"^[\W_]+|[\W_]+$", "", m.group(1), flags=re.UNICODE)
+            if b:
+                base = b.upper()
+                quote = m.group(2).upper()
 
     # 4) РЎР»РёС‚РЅРѕ BASEQUOTE (BTCUSDT, BIRBKRW, ETHBTC)
     if not base:
@@ -242,14 +290,7 @@ def extract(text: str) -> dict:
         if m:
             base = m.group(1).upper()
 
-    # 6) checklist line: "✅ XCU: Lighter (F)"
-    if not base:
-        m = re.search(r"^[^\S\r\n]*[✅✔☑]\s*([A-Za-z0-9/_-]{1,40})\s*:", raw, re.MULTILINE)
-        if m:
-            b, q, _ = _parse_symbol_from_checkline(m.group(1).strip())
-            base, quote = b, q
-
-    # 7) Listing-like wording without explicit market type usually means spot.
+    # 6) Listing-like wording without explicit market type usually means spot.
     if market_type is None and re.search(r"\blisted\s+on\b|\bwill\s+list\b|\bto\s+list\b|\broadmap\b", t):
         market_type = "spot"
 
@@ -272,7 +313,7 @@ def extract(text: str) -> dict:
 
 
 CHECKLINE_RE = re.compile(
-    r"^[^\S\r\n]*(?:\u2705|\u2714|\u2611)\s*([A-Za-z0-9/_-]{1,40})\s*:\s*(.+)$",
+    r"^[^\S\r\n]*(?:\u2705|\u2714|\u2611)\s*([^\s:]{1,80})\s*:\s*(.+)$",
     re.MULTILINE,
 )
 
@@ -307,8 +348,17 @@ def _parse_symbol_from_checkline(sym_raw: str):
         q = m.group(2).upper()
         return b, q, _display_symbol(b, q)
 
+    # Unicode token + known quote suffix (e.g. "龙虾USDT").
+    up = sym_raw.upper()
+    for q in sorted(QUOTES, key=len, reverse=True):
+        if up.endswith(q) and len(sym_raw) > len(q):
+            b = sym_raw[: -len(q)].strip()
+            b = re.sub(r"[/\-_]+$", "", b).strip()
+            if b:
+                return b.upper(), q, _display_symbol(b.upper(), q)
+
     # РёРЅР°С‡Рµ Р±РµСЂС‘Рј С†РµР»РёРєРѕРј РєР°Рє base (СѓРЅРёРІРµСЂСЃР°Р»СЊРЅРѕ)
-    b = re.sub(r"[^A-Za-z0-9]", "", sym_raw).upper()
+    b = re.sub(r"[\W_]+", "", sym_raw, flags=re.UNICODE).upper()
     return (b if b else None), None, _display_symbol(b if b else None, None)
 
 
