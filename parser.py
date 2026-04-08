@@ -93,6 +93,193 @@ def _extract_urls(raw: str) -> list[str]:
     return re.findall(r"https?://\S+", raw)
 
 
+def _clean_url(url: str | None) -> str | None:
+    if not url:
+        return None
+    return str(url).strip().rstrip(").,;]>'\"")
+
+
+DELISTING_FROM_RE = re.compile(
+    r"\b(?:delisted|removed)\s+from\s+(.+?)\s*(?:\b(spot|futures?|future|alpha projects?)\b|$)",
+    re.IGNORECASE,
+)
+DELISTING_TOKEN_RE = re.compile(r"\$([A-Z0-9]{1,20})\b", re.IGNORECASE)
+DELISTING_PAIR_RE = re.compile(
+    r"\b([A-Z0-9]{2,20})(USDT|USDC|USD|KRW|BTC|ETH|EUR|GBP|JPY)\b",
+    re.IGNORECASE,
+)
+DELISTING_WILL_TOKENS_RE = re.compile(
+    r"\bwill\s+delist\s+(.+?)(?:\bon\b|\bat\b|\(|\n|$)",
+    re.IGNORECASE,
+)
+DELISTING_PLAIN_TOKEN_STOPWORDS = {
+    "MULTIPLE",
+    "PERPETUAL",
+    "CONTRACT",
+    "CONTRACTS",
+    "MARGIN",
+    "FUTURES",
+    "FUTURE",
+    "SPOT",
+    "PAIR",
+    "PAIRS",
+}
+
+EXCHANGE_TITLE_MAP = {
+    "binance": "Binance",
+    "bybit": "Bybit",
+    "okx": "OKX",
+    "gate": "Gate",
+    "mexc": "MEXC",
+    "kucoin": "KuCoin",
+    "bitget": "Bitget",
+    "bingx": "BingX",
+    "hyperliquid": "Hyperliquid",
+    "coinbase": "Coinbase",
+    "kraken": "Kraken",
+    "upbit": "Upbit",
+    "bithumb": "Bithumb",
+    "htx": "HTX",
+    "bitfinex": "Bitfinex",
+    "bitmart": "BitMart",
+    "robinhood": "Robinhood",
+    "phemex": "Phemex",
+    "aster": "Aster",
+    "kcex": "KCEX",
+    "cryptocom": "CryptoCom",
+    "weex": "WEEX",
+    "lbank": "LBank",
+}
+
+
+def _normalize_exchange_name(name: str | None) -> str | None:
+    if not name:
+        return None
+    raw = re.sub(r"\s+", " ", str(name)).strip(" -:.,;()[]{}")
+    if not raw:
+        return None
+    key = raw.lower().replace(".", "").replace(" ", "")
+    if key in EXCHANGE_TITLE_MAP:
+        return EXCHANGE_TITLE_MAP[key]
+    if raw.lower() in EXCHANGE_TITLE_MAP:
+        return EXCHANGE_TITLE_MAP[raw.lower()]
+    return raw
+
+
+def extract_delisting(text: str) -> dict:
+    raw = text or ""
+
+    # Tokens (supports one or many symbols in a single message).
+    seen = set()
+    tokens = []
+    for tok in DELISTING_TOKEN_RE.findall(raw):
+        t = tok.upper()
+        if t not in seen:
+            seen.add(t)
+            tokens.append(t)
+
+    # CEX delisting feeds often use PAIR format like NFPUSDT (F) instead of $NFP.
+    for base, _quote in DELISTING_PAIR_RE.findall(raw):
+        t = base.upper()
+        if t not in seen:
+            seen.add(t)
+            tokens.append(t)
+
+    # Some feeds use plain token in text: "Will Delist WAN on ...".
+    for grp in DELISTING_WILL_TOKENS_RE.findall(raw):
+        parts = re.split(r",|/|&|\band\b", grp, flags=re.IGNORECASE)
+        for part in parts:
+            p = (part or "").strip(" -:.,;()[]{}")
+            if not p:
+                continue
+            t = p.upper()
+            if not re.fullmatch(r"[A-Z0-9]{2,20}", t):
+                continue
+            if t in DELISTING_PLAIN_TOKEN_STOPWORDS:
+                continue
+            if t not in seen:
+                seen.add(t)
+                tokens.append(t)
+
+    action = None
+    if re.search(
+        r"\bdelisted\b|\bdelist\b|\bdelisting\b|\bdelistings\b|делистинг",
+        raw,
+        re.IGNORECASE,
+    ):
+        action = "delisted"
+    elif re.search(r"\bremoved\b", raw, re.IGNORECASE):
+        action = "removed"
+    elif re.search(r"\btrading\s+changes?\b", raw, re.IGNORECASE):
+        action = "trading changes"
+
+    exchange = None
+    market_type = None
+    market_raw = ""
+
+    m = DELISTING_FROM_RE.search(raw)
+    if m:
+        exchange_raw = (m.group(1) or "").strip(" -:.,;()[]{}")
+        market_raw = (m.group(2) or "").strip().lower()
+        exchange = _normalize_exchange_name(exchange_raw)
+
+    if not market_raw:
+        if re.search(r"\(\s*(?:f|fut|future|futures|perp|perpetual)\s*\)", raw, re.IGNORECASE):
+            market_raw = "futures"
+        elif re.search(r"\(\s*(?:s|spot)\s*\)", raw, re.IGNORECASE):
+            market_raw = "spot"
+    if not market_raw:
+        if re.search(r"\bmargin\b", raw, re.IGNORECASE):
+            # Margin delist alerts are treated as spot-side event category.
+            market_raw = "spot"
+    if not market_raw:
+        if re.search(r"\balpha\s+projects?\b", raw, re.IGNORECASE):
+            market_raw = "alpha projects"
+        elif re.search(r"\bfutures?\b|\bfuture\b|\bperp\b|\bperpetual\b", raw, re.IGNORECASE):
+            market_raw = "futures"
+        elif re.search(r"\bspot\b", raw, re.IGNORECASE):
+            market_raw = "spot"
+
+    if market_raw.startswith("futur") or market_raw == "future":
+        market_type = "futures"
+    elif "spot" in market_raw:
+        market_type = "spot"
+    elif "alpha" in market_raw:
+        # Binance Alpha projects are spot-like market alerts.
+        market_type = "spot"
+        if re.search(r"\bbinance\b", raw, re.IGNORECASE):
+            exchange = "Binance Alpha"
+
+    if not exchange:
+        text_l = raw.lower()
+        for k, v in EXCHANGE_TITLE_MAP.items():
+            if re.search(rf"\b{re.escape(k)}\b", text_l):
+                exchange = v
+                break
+
+    urls = [_clean_url(u) for u in _extract_urls(raw)]
+    urls = [u for u in urls if u]
+    event_url = urls[0] if urls else None
+
+    confidence = "low"
+    if tokens and exchange and market_type:
+        confidence = "high"
+    elif tokens and (exchange or market_type):
+        confidence = "mid"
+    elif exchange and market_type and action:
+        confidence = "mid"
+
+    return {
+        "tokens": tokens,
+        "token": tokens[0] if tokens else None,
+        "exchange": exchange,
+        "market_type": market_type,
+        "action": action,
+        "event_url": event_url,
+        "confidence": confidence,
+    }
+
+
 def _infer_market_type_from_urls(raw: str) -> str | None:
     urls = _extract_urls(raw)
     if not urls:

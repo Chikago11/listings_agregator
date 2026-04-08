@@ -26,9 +26,16 @@ from config import (
     POSTS_LOG_PATH,
     TOKEN_TTL_DAYS,
 )
-from channels import CHANNELS
+from channels import (
+    CHANNELS,
+    CHANNEL_SKIP_PHRASES,
+    DELISTING_CHANNELS,
+    DELISTING_KEYWORD_CHANNELS,
+    DELISTING_CHANNEL_SKIP_PHRASES,
+    MONITORED_CHANNELS,
+)
 from db import init_db, is_seen, mark_seen, gc
-from parser import normalize_text, extract  # extract_many если подключишь позже
+from parser import normalize_text, extract, extract_delisting  # extract_many если подключишь позже
 from sender import send_alert
 from ex_links import build_exchange_link
 from post_log import append_post_log
@@ -144,7 +151,7 @@ def log_post_event(
 
 
 async def join_channels(client: TelegramClient):
-    for ch in CHANNELS:
+    for ch in MONITORED_CHANNELS:
         try:
             await client(JoinChannelRequest(ch))
             print("Joined:", ch)
@@ -158,6 +165,12 @@ async def run():
     async with TelegramClient(SESSION_NAME, API_ID, API_HASH) as client:
         await join_channels(client)
         process_lock = asyncio.Lock()
+        listing_channels_set = {c.lstrip("@").lower() for c in CHANNELS}
+        delisting_channels_set = {c.lstrip("@").lower() for c in DELISTING_CHANNELS}
+        dual_routing_channels_set = listing_channels_set & delisting_channels_set
+        delisting_keyword_channels_set = {
+            c.lstrip("@").lower() for c in DELISTING_KEYWORD_CHANNELS
+        }
 
         async def process_message(message, chat, source_chat_id=None):
             ch = getattr(chat, "username", None)
@@ -173,11 +186,14 @@ async def run():
             if await is_seen(msg_key):
                 return
 
-            # Old posts in listing channels are sometimes edited days later.
+            # Old posts in monitored channels are sometimes edited days later.
             # We keep fresh edits (useful for placeholder/reserved posts) but
             # ignore edits of old messages to prevent duplicate alerts.
             edit_date = getattr(message, "edit_date", None)
             ch_norm = (ch or "").lstrip("@").lower()
+            feed_type = "delisting" if ch_norm in delisting_channels_set else "listing"
+            if ch_norm in dual_routing_channels_set:
+                feed_type = "listing"
             bypass_old_edit_age = ch_norm in OLD_EDIT_BYPASS_CHANNELS
             if edit_date and MAX_EDIT_MESSAGE_AGE_SEC > 0 and not bypass_old_edit_age:
                 if is_older_than(message, MAX_EDIT_MESSAGE_AGE_SEC):
@@ -195,6 +211,19 @@ async def run():
             raw_text = message.message or message.raw_text or ""
             preview_text = build_preview_text(message)
             parse_text = raw_text if not preview_text else f"{raw_text}\n{preview_text}"
+            if (
+                feed_type == "listing"
+                and (
+                    ch_norm in delisting_keyword_channels_set
+                    or ch_norm in dual_routing_channels_set
+                )
+                and re.search(
+                    r"\bdelisted\b|\bdelist\b|\bdelisting\b|\bdelistings\b|\u0434\u0435\u043b\u0438\u0441\u0442\u0438\u043d\u0433",
+                    parse_text,
+                    re.IGNORECASE,
+                )
+            ):
+                feed_type = "delisting"
 
             # body_html keeps hidden links from entity markup.
             entities = message.entities or []
@@ -215,6 +244,24 @@ async def run():
                 await mark_seen(msg_key, MESSAGE_SEEN_TTL_SEC)
                 return
 
+            # Channel-specific content exceptions (case-insensitive).
+            skip_map = (
+                DELISTING_CHANNEL_SKIP_PHRASES
+                if feed_type == "delisting"
+                else CHANNEL_SKIP_PHRASES
+            )
+            skip_phrases = skip_map.get(ch_norm, ())
+            parse_text_lower = parse_text.lower()
+            if skip_phrases and any(phrase in parse_text_lower for phrase in skip_phrases):
+                print(f"Skip channel exception: source={source_tag} msg_id={msg_id}")
+                log_post_event(
+                    source=str(source_tag),
+                    original_post=original_post,
+                    status="skip: channel exception",
+                )
+                await mark_seen(msg_key, MESSAGE_SEEN_TTL_SEC)
+                return
+
             if not body_html:
                 body_html = html.escape(parse_text).replace("\n", "<br>")
 
@@ -223,7 +270,7 @@ async def run():
             if not norm:
                 norm = normalize_text(parse_text).lower()
             if not norm:
-                # URL-only posts are common in listings feeds.
+                # URL-only posts are common in feed channels.
                 norm = " ".join(parse_text.split()).lower()
             if not norm:
                 await mark_seen(msg_key, MESSAGE_SEEN_TTL_SEC)
@@ -231,7 +278,7 @@ async def run():
 
             # Keep text dedup per source channel so mirrored posts from
             # another feed do not fully suppress this source.
-            text_key = f"t:{source_tag}:" + sha256(norm)
+            text_key = f"t:{feed_type}:{source_tag}:" + sha256(norm)
             if await is_seen(text_key):
                 print(f"Skip text dedup: source={source_tag} msg_id={msg_id}")
                 log_post_event(
@@ -239,6 +286,102 @@ async def run():
                     original_post=original_post,
                     status="duplicate",
                 )
+                await mark_seen(msg_key, MESSAGE_SEEN_TTL_SEC)
+                return
+
+            source_url = msg_url(ch, msg_id) if ch else msg_url_fallback(chat_id, msg_id)
+            source_emoji = "\U0001F517"
+            src_title = getattr(chat, "title", None) or (f"@{ch}" if ch else "channel")
+            if source_url:
+                src_line = (
+                    f'{source_emoji} <b>Source:</b> '
+                    f'<a href="{html.escape(source_url, quote=True)}">{html.escape(str(src_title))}</a>'
+                )
+            else:
+                src_line = f"{source_emoji} <b>Source:</b> {html.escape(str(src_title))}"
+
+            if feed_type == "delisting":
+                dmeta = extract_delisting(parse_text)
+                tokens = dmeta.get("tokens") or []
+                exchange = (dmeta.get("exchange") or "").strip()
+                market = (dmeta.get("market_type") or "").strip().lower()
+                action = (dmeta.get("action") or "delisted").strip()
+                event_url = (dmeta.get("event_url") or "").strip()
+
+                if not exchange or market not in ("spot", "futures"):
+                    print(f"Skip delisting parse miss: source={source_tag} msg_id={msg_id}")
+                    log_post_event(
+                        source=str(src_title),
+                        original_post=original_post,
+                        status="skip: delisting parse miss",
+                    )
+                    await mark_seen(text_key, DEDUP_TEXT_TTL_SEC)
+                    await mark_seen(msg_key, MESSAGE_SEEN_TTL_SEC)
+                    return
+
+                if tokens:
+                    fresh_tokens = []
+                    for tok in tokens:
+                        dkey = f"d:{exchange}:{market}:{tok}"
+                        if await is_seen(dkey):
+                            continue
+                        fresh_tokens.append(tok)
+                        await mark_seen(dkey, DEDUP_STRUCT_TTL_SEC)
+
+                    if not fresh_tokens:
+                        print(f"Skip delisting struct dedup: source={source_tag} msg_id={msg_id}")
+                        log_post_event(
+                            source=str(src_title),
+                            original_post=original_post,
+                            status="duplicate",
+                        )
+                        await mark_seen(text_key, DEDUP_TEXT_TTL_SEC)
+                        await mark_seen(msg_key, MESSAGE_SEEN_TTL_SEC)
+                        return
+                else:
+                    # Some announcements describe "multiple contracts" without explicit symbols.
+                    # Use exchange+market+normalized text as fallback dedup key.
+                    dkey = f"d:{exchange}:{market}:bulk:{sha256(norm)}"
+                    if await is_seen(dkey):
+                        print(f"Skip delisting bulk dedup: source={source_tag} msg_id={msg_id}")
+                        log_post_event(
+                            source=str(src_title),
+                            original_post=original_post,
+                            status="duplicate",
+                        )
+                        await mark_seen(text_key, DEDUP_TEXT_TTL_SEC)
+                        await mark_seen(msg_key, MESSAGE_SEEN_TTL_SEC)
+                        return
+                    await mark_seen(dkey, DEDUP_STRUCT_TTL_SEC)
+
+                token_text = ", ".join(f"${t}" for t in tokens) if tokens else "MULTIPLE PAIRS"
+                market_label = "Futures" if market == "futures" else "Spot"
+                tag = "F" if market == "futures" else "S"
+                notice_emoji = "\U0001F4E2"
+
+                body_html = shorten_for_html(body_html, parse_text, limit=3000)
+                line1 = (
+                    f'\u26a0\ufe0f<b>Delisting</b>: '
+                    f'<b>{html.escape(token_text)}</b> ({html.escape(action)})'
+                )
+                line2 = f'\U0001F3E6 <b>Exchange:</b> {html.escape(exchange)}({tag})'
+                if event_url:
+                    line3 = (
+                        f'{notice_emoji} <b>Market:</b> '
+                        f'<a href="{html.escape(event_url, quote=True)}">{html.escape(market_label)}</a>'
+                    )
+                else:
+                    line3 = f"{notice_emoji} <b>Market:</b> {html.escape(market_label)}"
+
+                alert_html = f"{line1}\n{line2}\n{line3}\n{src_line}\n\n{body_html}"
+                await send_alert(alert_html, parse_mode="HTML", alert_type="delisting")
+                log_post_event(
+                    source=str(src_title),
+                    original_post=original_post,
+                    status="sent: delisting",
+                    post_for_user=alert_html,
+                )
+                await mark_seen(text_key, DEDUP_TEXT_TTL_SEC)
                 await mark_seen(msg_key, MESSAGE_SEEN_TTL_SEC)
                 return
 
@@ -263,10 +406,7 @@ async def run():
             mt_raw = (meta.get("market_type") or "").strip().lower()
             sym = meta.get("display") or (meta.get("base") or "?")
 
-            source_url = msg_url(ch, msg_id) if ch else msg_url_fallback(chat_id, msg_id)
-
             token_emoji = "\U0001FA99"
-            source_emoji = "\U0001F517"
 
             tag = "?"
             if mt_raw == "futures":
@@ -289,16 +429,10 @@ async def run():
 
             line1 = f'{token_emoji}<b>{html.escape(str(sym))}</b>: {ex_part}'
 
-            src_title = getattr(chat, "title", None) or (f"@{ch}" if ch else "channel")
-            if source_url:
-                src_line = f'{source_emoji} <b>Source:</b> <a href="{html.escape(source_url, quote=True)}">{html.escape(str(src_title))}</a>'
-            else:
-                src_line = f"{source_emoji} <b>Source:</b> {html.escape(str(src_title))}"
-
             body_html = shorten_for_html(body_html, parse_text, limit=3000)
             alert_html = f"{line1}\n{src_line}\n\n{body_html}"
 
-            await send_alert(alert_html, parse_mode="HTML")
+            await send_alert(alert_html, parse_mode="HTML", alert_type="listing")
             log_post_event(
                 source=str(src_title),
                 original_post=original_post,
@@ -328,8 +462,8 @@ async def run():
                     print("Handler error:", repr(e))
                     traceback.print_exc()
 
-        @client.on(events.NewMessage(chats=CHANNELS))
-        @client.on(events.MessageEdited(chats=CHANNELS))
+        @client.on(events.NewMessage(chats=MONITORED_CHANNELS))
+        @client.on(events.MessageEdited(chats=MONITORED_CHANNELS))
         async def handler(event):
             await process_message_locked(
                 event.message,
