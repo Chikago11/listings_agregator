@@ -28,6 +28,7 @@ EXCHANGES = {
     "Lighter",
     "weex",
     "lbank",
+    "ourbit",
 }
 
 # С‡С‚Рѕ СЃС‡РёС‚Р°РµРј "РєРѕС‚РёСЂРѕРІРєРѕР№" (quote)
@@ -103,6 +104,10 @@ DELISTING_FROM_RE = re.compile(
     r"\b(?:delisted|removed)\s+from\s+(.+?)\s*(?:\b(spot|futures?|future|alpha projects?)\b|$)",
     re.IGNORECASE,
 )
+DELISTING_ACTION_RE = re.compile(
+    r"\bdelisted\b|\bdelist\b|\bdelisting\b|\bdelistings\b|делистинг",
+    re.IGNORECASE,
+)
 DELISTING_TOKEN_RE = re.compile(r"\$([A-Z0-9]{1,20})\b", re.IGNORECASE)
 DELISTING_PAIR_RE = re.compile(
     r"\b([A-Z0-9]{2,20})(USDT|USDC|USD|KRW|BTC|ETH|EUR|GBP|JPY)\b",
@@ -149,6 +154,7 @@ EXCHANGE_TITLE_MAP = {
     "cryptocom": "CryptoCom",
     "weex": "WEEX",
     "lbank": "LBank",
+    "ourbit": "Ourbit",
 }
 
 
@@ -164,6 +170,10 @@ def _normalize_exchange_name(name: str | None) -> str | None:
     if raw.lower() in EXCHANGE_TITLE_MAP:
         return EXCHANGE_TITLE_MAP[raw.lower()]
     return raw
+
+
+def has_delisting_keyword(text: str) -> bool:
+    return bool(DELISTING_ACTION_RE.search(text or ""))
 
 
 def extract_delisting(text: str) -> dict:
@@ -201,17 +211,7 @@ def extract_delisting(text: str) -> dict:
                 seen.add(t)
                 tokens.append(t)
 
-    action = None
-    if re.search(
-        r"\bdelisted\b|\bdelist\b|\bdelisting\b|\bdelistings\b|делистинг",
-        raw,
-        re.IGNORECASE,
-    ):
-        action = "delisted"
-    elif re.search(r"\bremoved\b", raw, re.IGNORECASE):
-        action = "removed"
-    elif re.search(r"\btrading\s+changes?\b", raw, re.IGNORECASE):
-        action = "trading changes"
+    action = "delisted" if has_delisting_keyword(raw) else None
 
     exchange = None
     market_type = None
@@ -328,6 +328,31 @@ TOKEN_LINE_RE = re.compile(
     r"(?:^|\n)\s*(?:new\s+token|нов(?:ый|ая)\s+токен|token|токен)\s*[:：]\s*([^\n\r]{1,120})",
     re.IGNORECASE,
 )
+
+BINANCE_WALLET_FIRST_PLATFORM_RE = re.compile(
+    r"first\s+platform[\s\S]{0,240}?\(([A-Za-z0-9]{2,20})\)",
+    re.IGNORECASE,
+)
+
+
+def extract_binance_wallet_announcement(text: str) -> dict:
+    raw = text or ""
+    m = BINANCE_WALLET_FIRST_PLATFORM_RE.search(raw)
+    base = None
+    if m:
+        candidate = (m.group(1) or "").strip()
+        if re.fullmatch(r"[A-Z0-9]{2,20}", candidate):
+            base = candidate.upper()
+    display = _display_symbol(base, None) if base else None
+
+    return {
+        "exchange": "Binance Alpha",
+        "market_type": "spot",
+        "base": base,
+        "quote": None,
+        "display": display,
+        "confidence": "high" if base else "low",
+    }
 
 
 def extract(text: str) -> dict:

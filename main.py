@@ -16,6 +16,7 @@ from config import (
     SESSION_NAME,
     DEDUP_TEXT_TTL_SEC,
     DEDUP_STRUCT_TTL_SEC,
+    DELISTING_STRUCT_TTL_SEC,
     MAX_EDIT_MESSAGE_AGE_SEC,
     OLD_EDIT_BYPASS_CHANNELS,
     MESSAGE_SEEN_TTL_SEC,
@@ -35,7 +36,13 @@ from channels import (
     MONITORED_CHANNELS,
 )
 from db import init_db, is_seen, mark_seen, gc
-from parser import normalize_text, extract, extract_delisting  # extract_many если подключишь позже
+from parser import (
+    normalize_text,
+    extract,
+    extract_delisting,
+    has_delisting_keyword,
+    extract_binance_wallet_announcement,
+)  # extract_many если подключишь позже
 from sender import send_alert
 from ex_links import build_exchange_link
 from post_log import append_post_log
@@ -80,7 +87,9 @@ def message_version_ts(message) -> int:
 def is_older_than(message, max_age_sec: int) -> bool:
     if max_age_sec <= 0:
         return False
-    dt = as_utc(getattr(message, "edit_date", None) or getattr(message, "date", None))
+    # Age checks must be based on original post creation time.
+    # Otherwise an edit of a very old post looks "fresh" and can be resent.
+    dt = as_utc(getattr(message, "date", None))
     if not dt:
         return False
     age_sec = (datetime.now(timezone.utc) - dt).total_seconds()
@@ -171,6 +180,9 @@ async def run():
         delisting_keyword_channels_set = {
             c.lstrip("@").lower() for c in DELISTING_KEYWORD_CHANNELS
         }
+        channel_exchange_override = {
+            "ourbit_listings": "Ourbit",
+        }
 
         async def process_message(message, chat, source_chat_id=None):
             ch = getattr(chat, "username", None)
@@ -191,6 +203,7 @@ async def run():
             # ignore edits of old messages to prevent duplicate alerts.
             edit_date = getattr(message, "edit_date", None)
             ch_norm = (ch or "").lstrip("@").lower()
+            forced_exchange = channel_exchange_override.get(ch_norm)
             feed_type = "delisting" if ch_norm in delisting_channels_set else "listing"
             if ch_norm in dual_routing_channels_set:
                 feed_type = "listing"
@@ -217,11 +230,7 @@ async def run():
                     ch_norm in delisting_keyword_channels_set
                     or ch_norm in dual_routing_channels_set
                 )
-                and re.search(
-                    r"\bdelisted\b|\bdelist\b|\bdelisting\b|\bdelistings\b|\u0434\u0435\u043b\u0438\u0441\u0442\u0438\u043d\u0433",
-                    parse_text,
-                    re.IGNORECASE,
-                )
+                and has_delisting_keyword(raw_text)
             ):
                 feed_type = "delisting"
 
@@ -235,7 +244,22 @@ async def run():
 
             hidden_urls = extract_hidden_urls(body_html)
             if hidden_urls:
-                parse_text = f"{parse_text}\n" + "\n".join(hidden_urls)
+                hidden_block = "\n".join(hidden_urls)
+                parse_text = f"{parse_text}\n{hidden_block}" if parse_text else hidden_block
+            else:
+                hidden_block = ""
+
+            # Delisting parser should rely on source post body and hidden links.
+            # Web preview snippets may contain unrelated "delist" words.
+            delisting_parse_text = raw_text.strip()
+            if not delisting_parse_text:
+                delisting_parse_text = preview_text.strip()
+            if hidden_block:
+                delisting_parse_text = (
+                    f"{delisting_parse_text}\n{hidden_block}"
+                    if delisting_parse_text
+                    else hidden_block
+                )
 
             original_post = (raw_text or "").strip() or (parse_text or "").strip()
 
@@ -301,14 +325,14 @@ async def run():
                 src_line = f"{source_emoji} <b>Source:</b> {html.escape(str(src_title))}"
 
             if feed_type == "delisting":
-                dmeta = extract_delisting(parse_text)
+                dmeta = extract_delisting(delisting_parse_text)
                 tokens = dmeta.get("tokens") or []
-                exchange = (dmeta.get("exchange") or "").strip()
+                exchange = (forced_exchange or dmeta.get("exchange") or "").strip()
                 market = (dmeta.get("market_type") or "").strip().lower()
-                action = (dmeta.get("action") or "delisted").strip()
+                action = (dmeta.get("action") or "").strip()
                 event_url = (dmeta.get("event_url") or "").strip()
 
-                if not exchange or market not in ("spot", "futures"):
+                if not action or not exchange or market not in ("spot", "futures"):
                     print(f"Skip delisting parse miss: source={source_tag} msg_id={msg_id}")
                     log_post_event(
                         source=str(src_title),
@@ -326,7 +350,7 @@ async def run():
                         if await is_seen(dkey):
                             continue
                         fresh_tokens.append(tok)
-                        await mark_seen(dkey, DEDUP_STRUCT_TTL_SEC)
+                        await mark_seen(dkey, DELISTING_STRUCT_TTL_SEC)
 
                     if not fresh_tokens:
                         print(f"Skip delisting struct dedup: source={source_tag} msg_id={msg_id}")
@@ -352,7 +376,7 @@ async def run():
                         await mark_seen(text_key, DEDUP_TEXT_TTL_SEC)
                         await mark_seen(msg_key, MESSAGE_SEEN_TTL_SEC)
                         return
-                    await mark_seen(dkey, DEDUP_STRUCT_TTL_SEC)
+                    await mark_seen(dkey, DELISTING_STRUCT_TTL_SEC)
 
                 token_text = ", ".join(f"${t}" for t in tokens) if tokens else "MULTIPLE PAIRS"
                 market_label = "Futures" if market == "futures" else "Spot"
@@ -385,7 +409,22 @@ async def run():
                 await mark_seen(msg_key, MESSAGE_SEEN_TTL_SEC)
                 return
 
-            meta = extract(parse_text)
+            if ch_norm == "binance_wallet_announcements":
+                meta = extract_binance_wallet_announcement(parse_text)
+                if not meta.get("base"):
+                    print(f"Skip first-platform parse miss: source={source_tag} msg_id={msg_id}")
+                    log_post_event(
+                        source=str(src_title),
+                        original_post=original_post,
+                        status="skip: first-platform parse miss",
+                    )
+                    await mark_seen(text_key, DEDUP_TEXT_TTL_SEC)
+                    await mark_seen(msg_key, MESSAGE_SEEN_TTL_SEC)
+                    return
+            else:
+                meta = extract(parse_text)
+            if forced_exchange:
+                meta["exchange"] = forced_exchange
 
             # --- structured dedup ---
             if meta.get("base") and meta.get("exchange") and meta.get("market_type"):

@@ -14,6 +14,10 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 # --- Dedup ---
 DEDUP_TEXT_TTL_SEC = int(os.environ.get("DEDUP_TEXT_TTL_SEC", "10800"))
 DEDUP_STRUCT_TTL_SEC = int(os.environ.get("DEDUP_STRUCT_TTL_SEC", "43200"))
+# Delistings are low-frequency and should not repeat within a short window.
+DELISTING_STRUCT_TTL_SEC = int(
+    os.environ.get("DELISTING_STRUCT_TTL_SEC", "604800")
+)
 
 # --- Edited messages ---
 # Ignore edits of very old source posts to avoid duplicate alerts when channels
