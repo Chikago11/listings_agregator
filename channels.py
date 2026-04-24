@@ -25,6 +25,15 @@ CHANNEL_SKIP_PHRASES = {
     ),
 }
 
+# Per-channel required-word groups that indicate the post should be ignored.
+# Post is skipped if all words from any tuple are present (case-insensitive).
+CHANNEL_SKIP_ALL_WORDS = {
+    "metascalp_announcements_ru": (
+        ("обновление", "metascalp"),
+        ("обновления", "metascalp"),
+    ),
+}
+
 # Delisting feeds are configured separately from listing channels.
 # Add channels here one by one as they are approved.
 DELISTING_CHANNELS = [

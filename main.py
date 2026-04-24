@@ -30,6 +30,7 @@ from config import (
 from channels import (
     CHANNELS,
     CHANNEL_SKIP_PHRASES,
+    CHANNEL_SKIP_ALL_WORDS,
     DELISTING_CHANNELS,
     DELISTING_KEYWORD_CHANNELS,
     DELISTING_CHANNEL_SKIP_PHRASES,
@@ -181,6 +182,7 @@ async def run():
             c.lstrip("@").lower() for c in DELISTING_KEYWORD_CHANNELS
         }
         channel_exchange_override = {
+            "bitget_listings": "Bitget",
             "ourbit_listings": "Ourbit",
         }
 
@@ -282,6 +284,21 @@ async def run():
                     source=str(source_tag),
                     original_post=original_post,
                     status="skip: channel exception",
+                )
+                await mark_seen(msg_key, MESSAGE_SEEN_TTL_SEC)
+                return
+
+            # Channel-specific AND exceptions: skip when all words in a group exist.
+            skip_all_words_groups = CHANNEL_SKIP_ALL_WORDS.get(ch_norm, ())
+            if skip_all_words_groups and any(
+                all(word in parse_text_lower for word in group)
+                for group in skip_all_words_groups
+            ):
+                print(f"Skip channel exception (all words): source={source_tag} msg_id={msg_id}")
+                log_post_event(
+                    source=str(source_tag),
+                    original_post=original_post,
+                    status="skip: channel exception all words",
                 )
                 await mark_seen(msg_key, MESSAGE_SEEN_TTL_SEC)
                 return

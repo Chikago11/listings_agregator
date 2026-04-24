@@ -329,6 +329,11 @@ TOKEN_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 
+PIPE_LISTING_RE = re.compile(
+    r"^\s*([A-Z0-9]{1,20})\s*\|\s*(?:futures?|spot)\s+listing\b",
+    re.IGNORECASE,
+)
+
 BINANCE_WALLET_FIRST_PLATFORM_RE = re.compile(
     r"first\s+platform[\s\S]{0,240}?\(([A-Za-z0-9]{2,20})\)",
     re.IGNORECASE,
@@ -447,6 +452,12 @@ def extract(text: str) -> dict:
                 if b:
                     base = b
                     quote = quote or q
+
+    # 2.4) Feed title format: "TRADOOR | Futures Listing".
+    if not base:
+        m = PIPE_LISTING_RE.search(raw)
+        if m:
+            base = m.group(1).upper()
 
     # 3) BASE/QUOTE РёР»Рё BASE-QUOTE РёР»Рё BASE_QUOTE
     if not base:

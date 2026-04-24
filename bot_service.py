@@ -3,6 +3,7 @@ import logging
 import traceback
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 from channels import CHANNELS, DELISTING_CHANNELS
@@ -20,8 +21,10 @@ from tokens_ui import token_card_text, tokens_keyboard
 
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 _app: Application | None = None
+_bot_loop: asyncio.AbstractEventLoop | None = None
 _ALERTS_TEXT = (
     "\u041d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0438 \u043e\u043f\u043e\u0432\u0435\u0449\u0435\u043d\u0438\u0439:\n"
     "\u0414\u0435\u043b\u0438\u0441\u0442\u0438\u043d\u0433\u0438 \u043f\u043e\u043a\u0430 \u0432 \u0440\u0435\u0436\u0438\u043c\u0435 \u0437\u0430\u0433\u043b\u0443\u0448\u043a\u0438."
@@ -159,10 +162,35 @@ async def broadcast(
 ):
     global _app
     if _app is None:
+        logger.error("Broadcast skipped: bot application is not initialized")
+        return
+
+    loop = _bot_loop
+    if loop is not None and loop is not asyncio.get_running_loop():
+        future = asyncio.run_coroutine_threadsafe(
+            _broadcast_on_bot_loop(text, reply_markup, parse_mode, alert_type),
+            loop,
+        )
+        await asyncio.wrap_future(future)
+        return
+
+    await _broadcast_on_bot_loop(text, reply_markup, parse_mode, alert_type)
+
+
+async def _broadcast_on_bot_loop(
+    text: str,
+    reply_markup=None,
+    parse_mode: str | None = None,
+    alert_type: str | None = None,
+):
+    if _app is None:
+        logger.error("Broadcast skipped: bot application is not initialized")
         return
 
     subs = await get_subscribers(alert_type=alert_type)
     dead = []
+    sent = 0
+    failed = 0
 
     for chat_id in subs:
         try:
@@ -173,12 +201,41 @@ async def broadcast(
                 parse_mode=parse_mode,
                 disable_web_page_preview=True,
             )
+            sent += 1
             await asyncio.sleep(0.05)
-        except Exception:
+        except RetryAfter as e:
+            failed += 1
+            retry_after = int(getattr(e, "retry_after", 1) or 1)
+            logger.warning("Telegram flood limit while sending to %s: retry_after=%s", chat_id, retry_after)
+            await asyncio.sleep(max(1, retry_after))
+        except Forbidden as e:
+            failed += 1
+            logger.warning("Removing inactive subscriber %s: %s", chat_id, e)
             dead.append(chat_id)
+        except BadRequest as e:
+            failed += 1
+            logger.error("Telegram bad request for subscriber %s: %s", chat_id, e)
+        except TimedOut as e:
+            failed += 1
+            logger.warning("Telegram timeout for subscriber %s: %s", chat_id, e)
+        except TelegramError as e:
+            failed += 1
+            logger.exception("Telegram send failed for subscriber %s: %s", chat_id, e)
+        except Exception as e:
+            failed += 1
+            logger.exception("Unexpected send failed for subscriber %s: %s", chat_id, e)
 
     for chat_id in dead:
         await remove_subscriber(chat_id)
+
+    logger.info(
+        "Broadcast finished: alert_type=%s subscribers=%s sent=%s failed=%s removed=%s",
+        alert_type,
+        len(subs),
+        sent,
+        failed,
+        len(dead),
+    )
 
 
 def run_bot_polling_blocking():
@@ -187,7 +244,8 @@ def run_bot_polling_blocking():
     asyncio.set_event_loop(loop)
 
     async def _runner():
-        global _app
+        global _app, _bot_loop
+        _bot_loop = asyncio.get_running_loop()
         _app = Application.builder().token(BOT_TOKEN).build()
 
         _app.add_handler(CommandHandler("start", start_cmd))
