@@ -20,6 +20,16 @@ CREATE TABLE IF NOT EXISTS subscriber_alerts (
   delistings_enabled INTEGER NOT NULL DEFAULT 0,
   updated_at INTEGER NOT NULL
 );
+
+-- Holds the exchanges a subscriber switched OFF, not the ones they kept.
+-- Every exchange is on by default, so a new venue starts out visible to
+-- everyone instead of silently missing for existing subscribers.
+CREATE TABLE IF NOT EXISTS subscriber_exchange_filters (
+  chat_id INTEGER NOT NULL,
+  alert_type TEXT NOT NULL,
+  exchange TEXT NOT NULL,
+  PRIMARY KEY (chat_id, alert_type, exchange)
+);
 """
 
 ALERT_LISTING = "listing"
@@ -127,26 +137,104 @@ async def remove_subscriber(chat_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM subscribers WHERE chat_id=?", (chat_id,))
         await db.execute("DELETE FROM subscriber_alerts WHERE chat_id=?", (chat_id,))
+        await db.execute(
+            "DELETE FROM subscriber_exchange_filters WHERE chat_id=?", (chat_id,)
+        )
         await db.commit()
 
 
-async def get_subscribers(alert_type: str | None = None) -> list[int]:
+async def get_subscribers(
+    alert_type: str | None = None,
+    exchange: str | None = None,
+) -> list[int]:
+    """Subscribers to notify.
+
+    alert_type=None returns everyone. With an alert_type, the subscriber must
+    have that alert enabled; with an exchange on top of that, they must not
+    have switched this particular exchange off.
+    """
     async with aiosqlite.connect(DB_PATH) as db:
         if alert_type is None:
             cur = await db.execute("SELECT chat_id FROM subscribers")
         else:
             col = _alert_column(alert_type)
-            cur = await db.execute(
-                f"""
+            sql = f"""
                 SELECT s.chat_id
                 FROM subscribers s
                 LEFT JOIN subscriber_alerts a ON a.chat_id = s.chat_id
                 WHERE COALESCE(a.{col}, 0) = 1
+            """
+            params: tuple = ()
+            if exchange:
+                sql += """
+                  AND s.chat_id NOT IN (
+                    SELECT chat_id
+                    FROM subscriber_exchange_filters
+                    WHERE alert_type = ? AND exchange = ?
+                  )
                 """
-            )
+                params = (alert_type, exchange)
+            cur = await db.execute(sql, params)
         rows = await cur.fetchall()
         await cur.close()
         return [int(r[0]) for r in rows]
+
+
+# ---------- per-exchange filters ----------
+async def get_disabled_exchanges(chat_id: int, alert_type: str) -> set[str]:
+    _alert_column(alert_type)  # validates alert_type
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT exchange
+            FROM subscriber_exchange_filters
+            WHERE chat_id=? AND alert_type=?
+            """,
+            (chat_id, alert_type),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return {str(r[0]) for r in rows}
+
+
+async def set_exchange_selection(
+    chat_id: int,
+    alert_type: str,
+    disabled: set[str],
+) -> None:
+    """Replace the stored filter and keep the alert-type switch in sync.
+
+    An alert type with no exchanges left selected is the same thing as the
+    alert type being off, so callers pair this with set_alert_enabled().
+    """
+    _alert_column(alert_type)  # validates alert_type
+    await _ensure_alert_settings_row(chat_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM subscriber_exchange_filters WHERE chat_id=? AND alert_type=?",
+            (chat_id, alert_type),
+        )
+        await db.executemany(
+            """
+            INSERT OR IGNORE INTO subscriber_exchange_filters(
+                chat_id, alert_type, exchange
+            ) VALUES(?, ?, ?)
+            """,
+            [(chat_id, alert_type, ex) for ex in sorted(disabled)],
+        )
+        await db.commit()
+
+
+async def set_alert_enabled(chat_id: int, alert_type: str, enabled: bool) -> None:
+    col = _alert_column(alert_type)
+    now = int(time.time())
+    await _ensure_alert_settings_row(chat_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            f"UPDATE subscriber_alerts SET {col}=?, updated_at=? WHERE chat_id=?",
+            (1 if enabled else 0, now, chat_id),
+        )
+        await db.commit()
 
 
 async def get_subscriber_alert_settings(chat_id: int) -> dict[str, bool]:
@@ -172,19 +260,3 @@ async def get_subscriber_alert_settings(chat_id: int) -> dict[str, bool]:
     }
 
 
-async def toggle_subscriber_alert(chat_id: int, alert_type: str) -> dict[str, bool]:
-    col = _alert_column(alert_type)
-    await _ensure_alert_settings_row(chat_id)
-    now = int(time.time())
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            f"""
-            UPDATE subscriber_alerts
-            SET {col} = CASE WHEN {col}=1 THEN 0 ELSE 1 END,
-                updated_at=?
-            WHERE chat_id=?
-            """,
-            (now, chat_id),
-        )
-        await db.commit()
-    return await get_subscriber_alert_settings(chat_id)

@@ -2,7 +2,13 @@
 
 from ex_links import infer_market_type_from_url
 
-EXCHANGES = {
+# Order matters: the first match wins, so multi-word names must be checked
+# before the single-word names they contain ("binance alpha" before "binance"),
+# and short/ambiguous tickers go last. A set would be iterated in hash order,
+# which Python randomizes per process — the same post would then resolve to a
+# different exchange after every restart.
+EXCHANGES = (
+    "Binance Alpha",
     "binance",
     "bybit",
     "okx",
@@ -12,10 +18,12 @@ EXCHANGES = {
     "bitget",
     "bingx",
     "hyperliquid",
+    "polymarket",
     "coinbase",
     "kraken",
     "upbit",
     "bithumb",
+    "coinone",
     "htx",
     "bitfinex",
     "bitmart",
@@ -23,13 +31,13 @@ EXCHANGES = {
     "phemex",
     "Aster",
     "kcex",
-    "Binance Alpha",
     "CryptoCom",
     "Lighter",
     "weex",
     "lbank",
     "ourbit",
-}
+    "xt",
+)
 
 # С‡С‚Рѕ СЃС‡РёС‚Р°РµРј "РєРѕС‚РёСЂРѕРІРєРѕР№" (quote)
 QUOTES = {
@@ -105,16 +113,35 @@ DELISTING_FROM_RE = re.compile(
     re.IGNORECASE,
 )
 DELISTING_ACTION_RE = re.compile(
-    r"\bdelisted\b|\bdelist\b|\bdelisting\b|\bdelistings\b|делистинг",
+    r"\bdelisted\b|\bdelist\b|\bdelisting\b|\bdelistings\b|делистинг"
+    # Korean CEX notices: "거래지원 종료" = trading support ends, "상장폐지" = delisting.
+    r"|거래\s*지원\s*종료|상장\s*폐지",
     re.IGNORECASE,
 )
-DELISTING_TOKEN_RE = re.compile(r"\$([A-Z0-9]{1,20})\b", re.IGNORECASE)
+# Deliberately excludes "입출금 중단" (deposit/withdrawal pause) and "유의 종목"
+# (investment warning): neither removes the pair from trading.
+KOREAN_DELISTING_RE = re.compile(r"거래\s*지원\s*종료|상장\s*폐지")
+KOREAN_FUTURES_RE = re.compile(r"선물|무기한")
+# In these notices both the exchange and the tickers are the Latin text in
+# parentheses: 빗썸(Bithumb) 공지 [거래지원종료] 위치토큰(WITCH), 톡큰(TALK) ...
+KOREAN_PAREN_RE = re.compile(r"\(([A-Za-z0-9]{2,20})\)")
+# A cashtag must contain at least one letter, otherwise a price like "$100"
+# is parsed as the ticker "100".
+DELISTING_TOKEN_RE = re.compile(r"\$(?=[A-Za-z0-9]*[A-Za-z])([A-Za-z0-9]{1,20})\b")
 DELISTING_PAIR_RE = re.compile(
     r"\b([A-Z0-9]{2,20})(USDT|USDC|USD|KRW|BTC|ETH|EUR|GBP|JPY)\b",
     re.IGNORECASE,
 )
 DELISTING_WILL_TOKENS_RE = re.compile(
     r"\bwill\s+delist\s+(.+?)(?:\bon\b|\bat\b|\(|\n|$)",
+    re.IGNORECASE,
+)
+DELISTING_DELIST_AFTER_RE = re.compile(
+    r"\bdelist\s+(.+?)(?:\baround\b|\bon\b|\bat\b|\.|\n|$)",
+    re.IGNORECASE,
+)
+DELISTING_WAS_WERE_RE = re.compile(
+    r"\b([A-Z0-9][A-Z0-9,\s]*(?:\band\s+[A-Z0-9]+)?)\s+(?:was|were)\s+delisted\b",
     re.IGNORECASE,
 )
 DELISTING_PLAIN_TOKEN_STOPWORDS = {
@@ -128,6 +155,11 @@ DELISTING_PLAIN_TOKEN_STOPWORDS = {
     "SPOT",
     "PAIR",
     "PAIRS",
+    "WHETHER",
+    "ASSET",
+    "ASSETS",
+    "MARKET",
+    "MARKETS",
 }
 
 EXCHANGE_TITLE_MAP = {
@@ -140,10 +172,12 @@ EXCHANGE_TITLE_MAP = {
     "bitget": "Bitget",
     "bingx": "BingX",
     "hyperliquid": "Hyperliquid",
+    "polymarket": "Polymarket",
     "coinbase": "Coinbase",
     "kraken": "Kraken",
     "upbit": "Upbit",
     "bithumb": "Bithumb",
+    "coinone": "Coinone",
     "htx": "HTX",
     "bitfinex": "Bitfinex",
     "bitmart": "BitMart",
@@ -155,7 +189,16 @@ EXCHANGE_TITLE_MAP = {
     "weex": "WEEX",
     "lbank": "LBank",
     "ourbit": "Ourbit",
+    "xt": "XT",
+    "lighter": "Lighter",
+    "binancealpha": "Binance Alpha",
 }
+
+
+# Canonical spellings the parser can emit, in the order shown to subscribers.
+# Every alert carries one of these names or none at all, so this doubles as the
+# list of filter options in the bot menu.
+KNOWN_EXCHANGES = sorted(dict.fromkeys(EXCHANGE_TITLE_MAP.values()), key=str.lower)
 
 
 def _normalize_exchange_name(name: str | None) -> str | None:
@@ -174,6 +217,22 @@ def _normalize_exchange_name(name: str | None) -> str | None:
 
 def has_delisting_keyword(text: str) -> bool:
     return bool(DELISTING_ACTION_RE.search(text or ""))
+
+
+def _add_plain_delisting_tokens(raw_tokens: str, seen: set[str], tokens: list[str]) -> None:
+    parts = re.split(r",|/|&|\band\b", raw_tokens or "", flags=re.IGNORECASE)
+    for part in parts:
+        p = (part or "").strip(" -:.,;()[]{}")
+        if not p:
+            continue
+        t = p.upper()
+        if not re.fullmatch(r"[A-Z0-9]{2,20}", t):
+            continue
+        if t in DELISTING_PLAIN_TOKEN_STOPWORDS:
+            continue
+        if t not in seen:
+            seen.add(t)
+            tokens.append(t)
 
 
 def extract_delisting(text: str) -> dict:
@@ -197,19 +256,35 @@ def extract_delisting(text: str) -> dict:
 
     # Some feeds use plain token in text: "Will Delist WAN on ...".
     for grp in DELISTING_WILL_TOKENS_RE.findall(raw):
-        parts = re.split(r",|/|&|\band\b", grp, flags=re.IGNORECASE)
-        for part in parts:
-            p = (part or "").strip(" -:.,;()[]{}")
-            if not p:
+        _add_plain_delisting_tokens(grp, seen, tokens)
+
+    # Hyperliquid: "Validators will vote on whether to delist ARK and DOOD around ..."
+    for grp in DELISTING_DELIST_AFTER_RE.findall(raw):
+        _add_plain_delisting_tokens(grp, seen, tokens)
+
+    # Hyperliquid weekly updates: "BLAST, CHILLGUY, FTT, and TST were delisted".
+    for grp in DELISTING_WAS_WERE_RE.findall(raw):
+        _add_plain_delisting_tokens(grp, seen, tokens)
+
+    # Korean feeds (Upbit / Bithumb / Coinone) carry no English wording at all,
+    # so tickers and exchange come from the parenthesised Latin fragments.
+    korean_delisting = bool(KOREAN_DELISTING_RE.search(raw))
+    korean_exchange = None
+    if korean_delisting:
+        for grp in KOREAN_PAREN_RE.findall(raw):
+            if grp.lower() in EXCHANGE_TITLE_MAP:
+                if korean_exchange is None:
+                    korean_exchange = EXCHANGE_TITLE_MAP[grp.lower()]
                 continue
-            t = p.upper()
-            if not re.fullmatch(r"[A-Z0-9]{2,20}", t):
+            # Tickers in these notices are always uppercase Latin; anything else
+            # in parentheses is a Korean project name or a date.
+            if grp != grp.upper() or not re.fullmatch(r"[A-Z0-9]{2,20}", grp):
                 continue
-            if t in DELISTING_PLAIN_TOKEN_STOPWORDS:
+            if grp in DELISTING_PLAIN_TOKEN_STOPWORDS:
                 continue
-            if t not in seen:
-                seen.add(t)
-                tokens.append(t)
+            if grp not in seen:
+                seen.add(grp)
+                tokens.append(grp)
 
     action = "delisted" if has_delisting_keyword(raw) else None
 
@@ -240,6 +315,10 @@ def extract_delisting(text: str) -> dict:
         elif re.search(r"\bspot\b", raw, re.IGNORECASE):
             market_raw = "spot"
 
+    if not market_raw and korean_delisting:
+        # Upbit, Bithumb and Coinone are spot venues; a futures notice would say 선물.
+        market_raw = "futures" if KOREAN_FUTURES_RE.search(raw) else "spot"
+
     if market_raw.startswith("futur") or market_raw == "future":
         market_type = "futures"
     elif "spot" in market_raw:
@@ -250,12 +329,19 @@ def extract_delisting(text: str) -> dict:
         if re.search(r"\bbinance\b", raw, re.IGNORECASE):
             exchange = "Binance Alpha"
 
+    if not exchange and korean_exchange:
+        # The announcing venue is the first parenthesised name, which is more
+        # reliable than a keyword scan when the post also mentions other venues.
+        exchange = korean_exchange
+
     if not exchange:
         text_l = raw.lower()
         for k, v in EXCHANGE_TITLE_MAP.items():
             if re.search(rf"\b{re.escape(k)}\b", text_l):
                 exchange = v
                 break
+    if exchange == "Hyperliquid" and action and not market_type:
+        market_type = "futures"
 
     urls = [_clean_url(u) for u in _extract_urls(raw)]
     urls = [u for u in urls if u]
@@ -333,6 +419,10 @@ PIPE_LISTING_RE = re.compile(
     r"^\s*([A-Z0-9]{1,20})\s*\|\s*(?:futures?|spot)\s+listing\b",
     re.IGNORECASE,
 )
+HYPERLIQUID_WAS_LISTED_RE = re.compile(
+    r"\b([A-Z0-9]{2,20})(?:\s+[A-Z0-9]{2,20})?\s+(?:was|were)\s+listed\b",
+    re.IGNORECASE,
+)
 
 BINANCE_WALLET_FIRST_PLATFORM_RE = re.compile(
     r"first\s+platform[\s\S]{0,240}?\(([A-Za-z0-9]{2,20})\)",
@@ -374,16 +464,31 @@ def extract(text: str) -> dict:
     ):
         exchange = "Binance Alpha"
 
-    # exchange
+    # exchange: the venue named first in the post is the announcing one.
+    # Ties (an alias starting where a longer name does, "binance" inside
+    # "binance alpha") go to the longer name. Nothing here depends on the
+    # iteration order of EXCHANGES.
     if not exchange:
+        best = None
         for ex in EXCHANGES:
-            if re.search(rf"\b{re.escape(ex)}\b", t, re.IGNORECASE):
-                exchange = ex
+            for m in re.finditer(rf"\b{re.escape(ex)}\b", t, re.IGNORECASE):
+                # "$XT" is the ticker being listed, not the venue listing it.
+                if m.start() and t[m.start() - 1] in "$#":
+                    continue
+                cand = (m.start(), -len(ex))
+                if best is None or cand < best[0]:
+                    best = (cand, ex)
                 break
+        if best:
+            exchange = best[1]
         # --- special: Aster (domain/keywords) ---
         if not exchange:
             if "asterdex.com" in t or "asterfutures" in t or re.search(r"\baster\b", t):
                 exchange = "Aster"
+
+    # Always report the canonical spelling: dedup keys, CSV rows and alert text
+    # must not depend on how the source post happened to write the name.
+    exchange = _normalize_exchange_name(exchange)
 
     # market type
     market_type = None
@@ -421,11 +526,14 @@ def extract(text: str) -> dict:
     if m:
         base = m.group(1).upper()
 
-    # 2) $XPD
+    # 2) $XPD — a cashtag must contain a letter, otherwise a prize fund like
+    # "$20,000" is read as the ticker "20". Non-Latin tickers ($龙虾) count too.
     if not base:
-        m = re.search(r"\$([A-Z0-9]{1,20})\b", raw)
-        if m:
-            base = m.group(1).upper()
+        for m in re.finditer(r"\$([^\s$#,;:!?()\[\]{}<>]{1,20})", raw):
+            cand = m.group(1).strip(".,;:!?)]}\"'")
+            if cand and re.search(r"[^\W\d_]", cand, re.UNICODE):
+                base = cand.upper()
+                break
 
     # 2.1) #XPD
     if not base:
@@ -456,6 +564,12 @@ def extract(text: str) -> dict:
     # 2.4) Feed title format: "TRADOOR | Futures Listing".
     if not base:
         m = PIPE_LISTING_RE.search(raw)
+        if m:
+            base = m.group(1).upper()
+
+    # 2.5) Hyperliquid weekly updates: "SPCX IPOP was listed".
+    if not base:
+        m = HYPERLIQUID_WAS_LISTED_RE.search(raw)
         if m:
             base = m.group(1).upper()
 
@@ -516,6 +630,14 @@ def extract(text: str) -> dict:
     # 6) Listing-like wording without explicit market type usually means spot.
     if market_type is None and re.search(r"\blisted\s+on\b|\bwill\s+list\b|\bto\s+list\b|\broadmap\b", t):
         market_type = "spot"
+    if exchange == "Hyperliquid" and base and market_type is None and re.search(r"\b(?:was|were)\s+listed\b", t):
+        market_type = "futures"
+    # Polymarket lists perpetual futures only, quoted in USD rather than USDT.
+    if exchange == "Polymarket":
+        if market_type is None:
+            market_type = "futures"
+        if not quote:
+            quote = "USD"
 
     display = _display_symbol(base, quote)
 
@@ -576,7 +698,9 @@ def _parse_symbol_from_checkline(sym_raw: str):
     for q in sorted(QUOTES, key=len, reverse=True):
         if up.endswith(q) and len(sym_raw) > len(q):
             b = sym_raw[: -len(q)].strip()
-            b = re.sub(r"[/\-_]+$", "", b).strip()
+            # XT writes some pairs as "ARC.USDT"; the dot is a separator, and
+            # leaving it in yields the ticker "ARC." and a dead exchange link.
+            b = re.sub(r"[/\-_.]+$", "", b).strip()
             if b:
                 return b.upper(), q, _display_symbol(b.upper(), q)
 
@@ -616,6 +740,10 @@ def extract_many(text: str) -> list[dict]:
             # С‡РёСЃС‚РёРј С…РІРѕСЃС‚С‹ С‚РёРїР° "1пёЏвѓЈ"
             ex = re.sub(r"\s*\d+\ufe0f\u20e3$", "", ex).strip()
 
+            # Digest lines spell venues freely ("Kucoin", "BitGet"); dedup keys,
+            # subscriber filters and the CSV all key off the canonical name.
+            ex = _normalize_exchange_name(ex) or ex
+
             if tag == "F":
                 fut.append(ex)
             elif tag == "S":
@@ -638,6 +766,9 @@ def extract_many(text: str) -> list[dict]:
                 "display": display,
                 "futures_exchanges": uniq(fut),
                 "spot_exchanges": uniq(spot),
+                # The source line this entry came from, so an alert can quote
+                # just its own row instead of the whole digest.
+                "line": " ".join(m.group(0).split()),
             }
         )
 

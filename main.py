@@ -40,10 +40,11 @@ from db import init_db, is_seen, mark_seen, gc
 from parser import (
     normalize_text,
     extract,
+    extract_many,
     extract_delisting,
     has_delisting_keyword,
     extract_binance_wallet_announcement,
-)  # extract_many если подключишь позже
+)
 from sender import send_alert
 from ex_links import build_exchange_link
 from post_log import append_post_log
@@ -184,6 +185,10 @@ async def run():
         channel_exchange_override = {
             "bitget_listings": "Bitget",
             "ourbit_listings": "Ourbit",
+            "hyperliquid_announcements": "Hyperliquid",
+        }
+        channel_market_type_override = {
+            "hyperliquid_announcements": "futures",
         }
 
         async def process_message(message, chat, source_chat_id=None):
@@ -345,7 +350,11 @@ async def run():
                 dmeta = extract_delisting(delisting_parse_text)
                 tokens = dmeta.get("tokens") or []
                 exchange = (forced_exchange or dmeta.get("exchange") or "").strip()
-                market = (dmeta.get("market_type") or "").strip().lower()
+                market = (
+                    dmeta.get("market_type")
+                    or channel_market_type_override.get(ch_norm)
+                    or ""
+                ).strip().lower()
                 action = (dmeta.get("action") or "").strip()
                 event_url = (dmeta.get("event_url") or "").strip()
 
@@ -360,6 +369,9 @@ async def run():
                     await mark_seen(msg_key, MESSAGE_SEEN_TTL_SEC)
                     return
 
+                # Tokens that survive per-token dedup are the only ones worth
+                # announcing: a post can repeat pairs that were already sent.
+                alert_tokens = []
                 if tokens:
                     fresh_tokens = []
                     for tok in tokens:
@@ -368,6 +380,8 @@ async def run():
                             continue
                         fresh_tokens.append(tok)
                         await mark_seen(dkey, DELISTING_STRUCT_TTL_SEC)
+
+                    alert_tokens = fresh_tokens
 
                     if not fresh_tokens:
                         print(f"Skip delisting struct dedup: source={source_tag} msg_id={msg_id}")
@@ -395,7 +409,11 @@ async def run():
                         return
                     await mark_seen(dkey, DELISTING_STRUCT_TTL_SEC)
 
-                token_text = ", ".join(f"${t}" for t in tokens) if tokens else "MULTIPLE PAIRS"
+                token_text = (
+                    ", ".join(f"${t}" for t in alert_tokens)
+                    if alert_tokens
+                    else "MULTIPLE PAIRS"
+                )
                 market_label = "Futures" if market == "futures" else "Spot"
                 tag = "F" if market == "futures" else "S"
                 notice_emoji = "\U0001F4E2"
@@ -415,13 +433,159 @@ async def run():
                     line3 = f"{notice_emoji} <b>Market:</b> {html.escape(market_label)}"
 
                 alert_html = f"{line1}\n{line2}\n{line3}\n{src_line}\n\n{body_html}"
-                await send_alert(alert_html, parse_mode="HTML", alert_type="delisting")
+                await send_alert(
+                    alert_html,
+                    parse_mode="HTML",
+                    alert_type="delisting",
+                    exchange=exchange,
+                )
                 log_post_event(
                     source=str(src_title),
                     original_post=original_post,
                     status="sent: delisting",
                     post_for_user=alert_html,
                 )
+
+                # Hyperliquid weekly updates can contain listing and delisting
+                # events in one Telegram post. Preserve both alert types.
+                if ch_norm == "hyperliquid_announcements":
+                    lmeta = extract(parse_text)
+                    if forced_exchange:
+                        lmeta["exchange"] = forced_exchange
+                    if not lmeta.get("market_type"):
+                        lmeta["market_type"] = channel_market_type_override[ch_norm]
+
+                    if lmeta.get("base") and re.search(r"\b(?:was|were)\s+listed\b", parse_text, re.IGNORECASE):
+                        sym_key = lmeta.get("display") or lmeta.get("base") or ""
+                        lkey = f"s:{lmeta.get('exchange')}:{lmeta.get('market_type')}:{sym_key}"
+                        if not await is_seen(lkey):
+                            await mark_seen(lkey, DEDUP_STRUCT_TTL_SEC)
+
+                            lmt_raw = (lmeta.get("market_type") or "").strip().lower()
+                            ltag = "F" if lmt_raw == "futures" else "S" if lmt_raw == "spot" else "?"
+                            lex_known = (lmeta.get("exchange") or "").strip()
+                            lex_name = lex_known or "unknown"
+                            lbase = (lmeta.get("base") or "").strip()
+                            lquote = (lmeta.get("quote") or "USDC").strip().upper()
+                            lex_url = None
+                            if lex_name and lbase and lmt_raw in ("spot", "futures"):
+                                lex_url = build_exchange_link(lex_name, lmt_raw, base=lbase, quote=lquote)
+
+                            if lex_url:
+                                lex_part = f'<a href="{html.escape(lex_url, quote=True)}">{html.escape(lex_name)}</a>({ltag})'
+                            else:
+                                lex_part = f"{html.escape(lex_name)}({ltag})"
+
+                            lline1 = f'\U0001FA99<b>{html.escape(str(sym_key))}</b>: {lex_part}'
+                            lalert_html = f"{lline1}\n{src_line}\n\n{body_html}"
+                            await send_alert(
+                                lalert_html,
+                                parse_mode="HTML",
+                                alert_type="listing",
+                                exchange=lex_known,
+                            )
+                            log_post_event(
+                                source=str(src_title),
+                                original_post=original_post,
+                                status="sent: listing",
+                                post_for_user=lalert_html,
+                            )
+                            if lbase and lex_known and lmt_raw in ("spot", "futures"):
+                                try:
+                                    upsert_listing(
+                                        token=lbase,
+                                        market_type=lmt_raw,
+                                        exchange=lex_name,
+                                    )
+                                except Exception as e:
+                                    print("CSV store error:", repr(e))
+
+                await mark_seen(text_key, DEDUP_TEXT_TTL_SEC)
+                await mark_seen(msg_key, MESSAGE_SEEN_TTL_SEC)
+                return
+
+            # Metascalp publishes a daily digest holding every listing of the
+            # day. extract() reports only its first line, so the other venues in
+            # the post never reach anyone. Fan the digest out into one alert per
+            # (symbol, market, exchange) — the granularity subscribers filter by.
+            digest_items = [] if forced_exchange else extract_many(parse_text)
+            if len(digest_items) > 1:
+                digest_sent = 0
+                for item in digest_items:
+                    ibase = (item.get("base") or "").strip()
+                    if not ibase:
+                        continue
+
+                    isym = item.get("display") or ibase
+                    iquote = (item.get("quote") or "USDT").strip().upper()
+                    # Quote the entry's own line rather than the whole digest.
+                    ibody = html.escape(item.get("line") or "") or body_html
+
+                    for imarket, ivenues in (
+                        ("futures", item.get("futures_exchanges") or []),
+                        ("spot", item.get("spot_exchanges") or []),
+                    ):
+                        for venue in ivenues:
+                            iex = (venue or "").strip()
+                            if not iex:
+                                continue
+
+                            ikey = f"s:{iex}:{imarket}:{isym}"
+                            if await is_seen(ikey):
+                                continue
+                            await mark_seen(ikey, DEDUP_STRUCT_TTL_SEC)
+
+                            itag = "F" if imarket == "futures" else "S"
+                            iurl = build_exchange_link(
+                                iex, imarket, base=ibase, quote=iquote
+                            )
+                            if iurl:
+                                ipart = (
+                                    f'<a href="{html.escape(iurl, quote=True)}">'
+                                    f"{html.escape(iex)}</a>({itag})"
+                                )
+                            else:
+                                ipart = f"{html.escape(iex)}({itag})"
+
+                            ialert = (
+                                f"\U0001FA99<b>{html.escape(str(isym))}</b>: {ipart}"
+                                f"\n{src_line}\n\n{ibody}"
+                            )
+                            await send_alert(
+                                ialert,
+                                parse_mode="HTML",
+                                alert_type="listing",
+                                exchange=iex,
+                            )
+                            digest_sent += 1
+                            log_post_event(
+                                source=str(src_title),
+                                original_post=original_post,
+                                status="sent: digest",
+                                post_for_user=ialert,
+                            )
+                            try:
+                                upsert_listing(
+                                    token=ibase,
+                                    market_type=imarket,
+                                    exchange=iex,
+                                )
+                            except Exception as e:
+                                print("CSV store error:", repr(e))
+
+                if digest_sent:
+                    print(
+                        f"Digest expanded: source={source_tag} msg_id={msg_id} "
+                        f"items={len(digest_items)} alerts={digest_sent}"
+                    )
+                else:
+                    print(f"Skip digest dedup: source={source_tag} msg_id={msg_id}")
+                    log_post_event(
+                        source=str(src_title),
+                        original_post=original_post,
+                        status="duplicate",
+                    )
+
                 await mark_seen(text_key, DEDUP_TEXT_TTL_SEC)
                 await mark_seen(msg_key, MESSAGE_SEEN_TTL_SEC)
                 return
@@ -442,6 +606,22 @@ async def run():
                 meta = extract(parse_text)
             if forced_exchange:
                 meta["exchange"] = forced_exchange
+            if not meta.get("market_type") and ch_norm in channel_market_type_override:
+                meta["market_type"] = channel_market_type_override[ch_norm]
+
+            # No symbol means there is nothing to announce: the alert would read
+            # "?" and tell the subscriber nothing. The delisting branch above
+            # applies the same rule to its own required fields.
+            if not meta.get("base"):
+                print(f"Skip listing parse miss: source={source_tag} msg_id={msg_id}")
+                log_post_event(
+                    source=str(src_title),
+                    original_post=original_post,
+                    status="skip: listing parse miss",
+                )
+                await mark_seen(text_key, DEDUP_TEXT_TTL_SEC)
+                await mark_seen(msg_key, MESSAGE_SEEN_TTL_SEC)
+                return
 
             # --- structured dedup ---
             if meta.get("base") and meta.get("exchange") and meta.get("market_type"):
@@ -470,7 +650,8 @@ async def run():
             elif mt_raw == "spot":
                 tag = "S"
 
-            ex_name = (meta.get("exchange") or "unknown").strip()
+            ex_known = (meta.get("exchange") or "").strip()
+            ex_name = ex_known or "unknown"
             base = (meta.get("base") or "").strip()
             quote = (meta.get("quote") or "USDT").strip().upper()
 
@@ -488,7 +669,12 @@ async def run():
             body_html = shorten_for_html(body_html, parse_text, limit=3000)
             alert_html = f"{line1}\n{src_line}\n\n{body_html}"
 
-            await send_alert(alert_html, parse_mode="HTML", alert_type="listing")
+            await send_alert(
+                alert_html,
+                parse_mode="HTML",
+                alert_type="listing",
+                exchange=ex_known,
+            )
             log_post_event(
                 source=str(src_title),
                 original_post=original_post,
@@ -496,7 +682,9 @@ async def run():
                 post_for_user=alert_html,
             )
             # Keep token state in sync with what was actually sent by the bot.
-            if base and ex_name and mt_raw in ("spot", "futures"):
+            # An unrecognised venue must not reach the CSV: "unknown" would show
+            # up in the /tokens card as if it were an exchange.
+            if base and ex_known and mt_raw in ("spot", "futures"):
                 try:
                     upsert_listing(
                         token=base,

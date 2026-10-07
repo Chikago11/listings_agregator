@@ -11,6 +11,7 @@ CHANNELS = [
     "gate_fut",
     "bitget_listings",
     "ourbit_listings",
+    "hyperliquid_announcements",
 ]
 
 # Per-channel phrases that indicate the post should be ignored.
@@ -22,6 +23,7 @@ CHANNEL_SKIP_PHRASES = {
         "дорогие трейдеры",
         "уважаемые пользователи",
         "новый shorts на нашем",
+        "новое видео на нашем",
     ),
 }
 
@@ -42,6 +44,7 @@ DELISTING_CHANNELS = [
     "cex_delisting",
     "coin_listing",
     "upbitcexradar",
+    "hyperliquid_announcements",
 ]
 
 # Per-channel phrases for delisting feeds that should be ignored.
@@ -50,6 +53,7 @@ DELISTING_CHANNEL_SKIP_PHRASES = {
     "delistingsfeed": (),
     "delist_binance": (),
     "cex_delisting": (),
+    "hyperliquid_announcements": (),
 }
 
 # Listing feeds where only specific messages should be treated as delistings.

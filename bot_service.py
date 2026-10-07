@@ -12,24 +12,44 @@ from db import (
     ALERT_DELISTING,
     ALERT_LISTING,
     add_subscriber,
+    get_disabled_exchanges,
     get_subscriber_alert_settings,
     get_subscribers,
     remove_subscriber,
-    toggle_subscriber_alert,
+    set_alert_enabled,
+    set_exchange_selection,
 )
+from parser import KNOWN_EXCHANGES
 from tokens_ui import token_card_text, tokens_keyboard
 
 
 logging.basicConfig(level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("telethon").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 _app: Application | None = None
 _bot_loop: asyncio.AbstractEventLoop | None = None
-_ALERTS_TEXT = (
-    "\u041d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0438 \u043e\u043f\u043e\u0432\u0435\u0449\u0435\u043d\u0438\u0439:\n"
-    "\u0414\u0435\u043b\u0438\u0441\u0442\u0438\u043d\u0433\u0438 \u043f\u043e\u043a\u0430 \u0432 \u0440\u0435\u0436\u0438\u043c\u0435 \u0437\u0430\u0433\u043b\u0443\u0448\u043a\u0438."
+
+# Alerts whose venue the parser could not identify are still worth delivering,
+# so subscribers get an explicit switch for them instead of a silent leak.
+OTHER_EXCHANGE_KEY = "__other__"
+OTHER_EXCHANGE_LABEL = "\u041f\u0440\u043e\u0447\u0438\u0435"
+ALERT_EXCHANGES: list[str] = [*KNOWN_EXCHANGES, OTHER_EXCHANGE_KEY]
+
+_ALERT_TITLES = {
+    ALERT_LISTING: "\u041b\u0438\u0441\u0442\u0438\u043d\u0433\u0438",
+    ALERT_DELISTING: "\u0414\u0435\u043b\u0438\u0441\u0442\u0438\u043d\u0433\u0438",
+}
+_ALERTS_ROOT_TEXT = (
+    "\U0001F514 <b>\u041d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0438 "
+    "\u043e\u043f\u043e\u0432\u0435\u0449\u0435\u043d\u0438\u0439</b>\n\n"
+    "\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u0440\u0430\u0437\u0434\u0435\u043b, "
+    "\u0447\u0442\u043e\u0431\u044b \u043e\u0442\u043c\u0435\u0442\u0438\u0442\u044c \u0431\u0438\u0440\u0436\u0438."
 )
-_ALERT_TOGGLE_PREFIX = "alerts:toggle:"
+_PENDING_KEY = "alerts_pending"
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -72,30 +92,186 @@ async def tokens_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Tokens:", reply_markup=tokens_keyboard(page=0))
 
 
-def alerts_keyboard(settings: dict[str, bool]) -> InlineKeyboardMarkup:
-    listing_mark = "\u2705" if settings.get(ALERT_LISTING, True) else "\u2B1C"
-    delisting_mark = "\u2705" if settings.get(ALERT_DELISTING, False) else "\u2B1C"
+def exchange_label(key: str) -> str:
+    return OTHER_EXCHANGE_LABEL if key == OTHER_EXCHANGE_KEY else key
+
+
+def exchange_filter_key(exchange: str | None) -> str:
+    """Map the exchange on an alert to the switch that controls it."""
+    name = (exchange or "").strip()
+    return name if name in KNOWN_EXCHANGES else OTHER_EXCHANGE_KEY
+
+
+async def stored_selection(chat_id: int, alert_type: str) -> set[str]:
+    """Exchanges currently switched on for this subscriber.
+
+    A disabled alert type reads as "nothing selected", so the menu always shows
+    the same state the broadcaster acts on.
+    """
+    settings = await get_subscriber_alert_settings(chat_id)
+    if not settings.get(alert_type, False):
+        return set()
+    disabled = await get_disabled_exchanges(chat_id, alert_type)
+    return {ex for ex in ALERT_EXCHANGES if ex not in disabled}
+
+
+def selection_summary(selected: set[str]) -> str:
+    total = len(ALERT_EXCHANGES)
+    if not selected:
+        return "\u0432\u044b\u043a\u043b\u044e\u0447\u0435\u043d\u043e"
+    if len(selected) >= total:
+        return "\u0432\u0441\u0435 \u0431\u0438\u0440\u0436\u0438"
+    return f"{len(selected)} \u0438\u0437 {total}"
+
+
+def alerts_root_keyboard(counts: dict[str, set[str]]) -> InlineKeyboardMarkup:
+    rows = []
+    for alert_type in (ALERT_LISTING, ALERT_DELISTING):
+        selected = counts.get(alert_type, set())
+        mark = "\u2705" if selected else "\u2B1C"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{mark} {_ALERT_TITLES[alert_type]} \u2014 {selection_summary(selected)}",
+                    callback_data=f"al:open:{alert_type}",
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(rows)
+
+
+def exchanges_keyboard(alert_type: str, selected: set[str]) -> InlineKeyboardMarkup:
     rows = [
         [
-            InlineKeyboardButton(
-                f"{listing_mark} \u041b\u0438\u0441\u0442\u0438\u043d\u0433\u0438",
-                callback_data=f"{_ALERT_TOGGLE_PREFIX}{ALERT_LISTING}",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                f"{delisting_mark} \u0414\u0435\u043b\u0438\u0441\u0442\u0438\u043d\u0433\u0438",
-                callback_data=f"{_ALERT_TOGGLE_PREFIX}{ALERT_DELISTING}",
-            )
-        ],
+            InlineKeyboardButton("\u0412\u044b\u0431\u0440\u0430\u0442\u044c \u0432\u0441\u0435", callback_data=f"al:all:{alert_type}"),
+            InlineKeyboardButton("\u0421\u0431\u0440\u043e\u0441\u0438\u0442\u044c \u0432\u0441\u0435", callback_data=f"al:none:{alert_type}"),
+        ]
     ]
+
+    pair: list[InlineKeyboardButton] = []
+    for key in ALERT_EXCHANGES:
+        mark = "\u2705" if key in selected else "\u2B1C"
+        # Carry the exchange name, not its position: adding a venue must not
+        # turn the buttons of an already-open menu into their neighbours.
+        pair.append(
+            InlineKeyboardButton(
+                f"{mark} {exchange_label(key)}",
+                callback_data=f"al:tog:{alert_type}:{key}",
+            )
+        )
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+
+    rows.append(
+        [
+            InlineKeyboardButton("\u25c0\ufe0f \u041d\u0430\u0437\u0430\u0434", callback_data="al:back"),
+            InlineKeyboardButton("\u041f\u0440\u0438\u043c\u0435\u043d\u0438\u0442\u044c", callback_data=f"al:apply:{alert_type}"),
+        ]
+    )
     return InlineKeyboardMarkup(rows)
+
+
+def exchanges_text(alert_type: str, selected: set[str]) -> str:
+    return (
+        f"<b>{_ALERT_TITLES[alert_type]}</b>\n\n"
+        f"\u041e\u0442\u043c\u0435\u0447\u0435\u043d\u043e: {selection_summary(selected)}\n"
+        "\u0418\u0437\u043c\u0435\u043d\u0435\u043d\u0438\u044f \u0432\u0441\u0442\u0443\u043f\u044f\u0442 \u0432 \u0441\u0438\u043b\u0443 \u043f\u043e\u0441\u043b\u0435 \u00ab\u041f\u0440\u0438\u043c\u0435\u043d\u0438\u0442\u044c\u00bb."
+    )
+
+
+async def alerts_root_markup(chat_id: int) -> InlineKeyboardMarkup:
+    counts = {
+        alert_type: await stored_selection(chat_id, alert_type)
+        for alert_type in (ALERT_LISTING, ALERT_DELISTING)
+    }
+    return alerts_root_keyboard(counts)
 
 
 async def alerts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    settings = await get_subscriber_alert_settings(chat_id)
-    await update.message.reply_text(_ALERTS_TEXT, reply_markup=alerts_keyboard(settings))
+    context.user_data.pop(_PENDING_KEY, None)
+    await update.message.reply_text(
+        _ALERTS_ROOT_TEXT,
+        parse_mode="HTML",
+        reply_markup=await alerts_root_markup(chat_id),
+    )
+
+
+async def _edit(q, text: str, markup: InlineKeyboardMarkup):
+    """Repainting a screen that already looks like this is not an error."""
+    try:
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            raise
+
+
+async def alerts_cb(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
+    chat_id = update.effective_chat.id
+    q = update.callback_query
+    parts = data.split(":", 3)
+    action = parts[1] if len(parts) > 1 else ""
+    alert_type = parts[2] if len(parts) > 2 else ""
+
+    # A callback query may be answered exactly once; "apply" answers with a
+    # toast of its own further down.
+    if action != "apply":
+        await q.answer()
+
+    # Edits live in user_data until "Применить", so "Назад" really discards them.
+    pending: dict[str, set[str]] = context.user_data.setdefault(_PENDING_KEY, {})
+
+    if action == "back":
+        context.user_data.pop(_PENDING_KEY, None)
+        await _edit(q, _ALERTS_ROOT_TEXT, await alerts_root_markup(chat_id))
+        return
+
+    if alert_type not in _ALERT_TITLES:
+        return
+
+    if action == "open":
+        # A restart drops pending edits; fall back to what is stored.
+        pending[alert_type] = await stored_selection(chat_id, alert_type)
+    elif action == "all":
+        pending[alert_type] = set(ALERT_EXCHANGES)
+    elif action == "none":
+        pending[alert_type] = set()
+    elif action == "tog":
+        selected = pending.get(alert_type)
+        if selected is None:
+            selected = await stored_selection(chat_id, alert_type)
+        key = parts[3] if len(parts) > 3 else ""
+        if key not in ALERT_EXCHANGES:
+            return
+        selected = set(selected)
+        if key in selected:
+            selected.discard(key)
+        else:
+            selected.add(key)
+        pending[alert_type] = selected
+    elif action == "apply":
+        selected = pending.get(alert_type)
+        if selected is None:
+            selected = await stored_selection(chat_id, alert_type)
+        disabled = {ex for ex in ALERT_EXCHANGES if ex not in selected}
+        await set_exchange_selection(chat_id, alert_type, disabled)
+        await set_alert_enabled(chat_id, alert_type, bool(selected))
+        context.user_data.pop(_PENDING_KEY, None)
+        await q.answer(f"Сохранено: {selection_summary(selected)}")
+        await _edit(q, _ALERTS_ROOT_TEXT, await alerts_root_markup(chat_id))
+        return
+    else:
+        return
+
+    selected = pending[alert_type]
+    await _edit(
+        q,
+        exchanges_text(alert_type, selected),
+        exchanges_keyboard(alert_type, selected),
+    )
 
 
 async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -103,13 +279,12 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
         data = q.data or ""
         print("CB:", data)
-        await q.answer("OK")
 
-        if data.startswith(_ALERT_TOGGLE_PREFIX):
-            alert_type = data.replace(_ALERT_TOGGLE_PREFIX, "", 1)
-            settings = await toggle_subscriber_alert(update.effective_chat.id, alert_type)
-            await q.edit_message_reply_markup(reply_markup=alerts_keyboard(settings))
+        if data.startswith("al:"):
+            await alerts_cb(update, context, data)
             return
+
+        await q.answer("OK")
 
         if data.startswith("tokpage:"):
             page = int(data.split(":")[1])
@@ -159,8 +334,8 @@ async def broadcast(
     reply_markup=None,
     parse_mode: str | None = None,
     alert_type: str | None = None,
+    exchange: str | None = None,
 ):
-    global _app
     if _app is None:
         logger.error("Broadcast skipped: bot application is not initialized")
         return
@@ -168,13 +343,13 @@ async def broadcast(
     loop = _bot_loop
     if loop is not None and loop is not asyncio.get_running_loop():
         future = asyncio.run_coroutine_threadsafe(
-            _broadcast_on_bot_loop(text, reply_markup, parse_mode, alert_type),
+            _broadcast_on_bot_loop(text, reply_markup, parse_mode, alert_type, exchange),
             loop,
         )
         await asyncio.wrap_future(future)
         return
 
-    await _broadcast_on_bot_loop(text, reply_markup, parse_mode, alert_type)
+    await _broadcast_on_bot_loop(text, reply_markup, parse_mode, alert_type, exchange)
 
 
 async def _broadcast_on_bot_loop(
@@ -182,12 +357,14 @@ async def _broadcast_on_bot_loop(
     reply_markup=None,
     parse_mode: str | None = None,
     alert_type: str | None = None,
+    exchange: str | None = None,
 ):
     if _app is None:
         logger.error("Broadcast skipped: bot application is not initialized")
         return
 
-    subs = await get_subscribers(alert_type=alert_type)
+    filter_key = exchange_filter_key(exchange) if alert_type else None
+    subs = await get_subscribers(alert_type=alert_type, exchange=filter_key)
     dead = []
     sent = 0
     failed = 0
@@ -229,8 +406,9 @@ async def _broadcast_on_bot_loop(
         await remove_subscriber(chat_id)
 
     logger.info(
-        "Broadcast finished: alert_type=%s subscribers=%s sent=%s failed=%s removed=%s",
+        "Broadcast finished: alert_type=%s exchange=%s subscribers=%s sent=%s failed=%s removed=%s",
         alert_type,
+        filter_key,
         len(subs),
         sent,
         failed,
@@ -247,6 +425,18 @@ def run_bot_polling_blocking():
         global _app, _bot_loop
         _bot_loop = asyncio.get_running_loop()
         _app = Application.builder().token(BOT_TOKEN).build()
+        fatal_polling_error: TelegramError | None = None
+        fatal_polling_event = asyncio.Event()
+
+        def polling_error_callback(error: TelegramError) -> None:
+            nonlocal fatal_polling_error
+            logger.exception("Telegram polling error: %s", error, exc_info=error)
+
+            # This means the event loop/executor is already shutting down.
+            # Retrying inside PTB leaves the bot dead while the process stays alive.
+            if "cannot schedule new futures after shutdown" in str(error):
+                fatal_polling_error = error
+                fatal_polling_event.set()
 
         _app.add_handler(CommandHandler("start", start_cmd))
         _app.add_handler(CommandHandler("stop", stop_cmd))
@@ -257,11 +447,63 @@ def run_bot_polling_blocking():
         _app.add_handler(CommandHandler("channels", channels_cmd))
         _app.add_handler(CallbackQueryHandler(cb_handler))
 
-        await _app.initialize()
-        await _app.bot.delete_webhook(drop_pending_updates=True)
-        await _app.start()
-        await _app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        try:
+            await _app.initialize()
+            await _app.bot.delete_webhook(drop_pending_updates=True)
+            await _app.start()
+            await _app.updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                error_callback=polling_error_callback,
+            )
 
-        await asyncio.Event().wait()  # держим поток живым
+            keep_alive_task = asyncio.create_task(asyncio.Event().wait())
+            fatal_task = asyncio.create_task(fatal_polling_event.wait())
+            watch_tasks = [keep_alive_task, fatal_task]
+            polling_task = getattr(_app.updater, "_Updater__polling_task", None)
+            if polling_task is not None:
+                watch_tasks.append(polling_task)
 
-    loop.run_until_complete(_runner())
+            done, pending = await asyncio.wait(
+                watch_tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+            if fatal_task in done:
+                raise RuntimeError(
+                    "Fatal Telegram polling error; exiting for supervisor restart"
+                ) from fatal_polling_error
+
+            if polling_task is not None and polling_task in done:
+                exc = polling_task.exception()
+                if exc:
+                    raise RuntimeError("Telegram polling task failed") from exc
+                raise RuntimeError("Telegram polling task stopped unexpectedly")
+        finally:
+            app = _app
+            _app = None
+            _bot_loop = None
+            if app is not None:
+                try:
+                    if app.updater and app.updater.running:
+                        await app.updater.stop()
+                except Exception:
+                    logger.exception("Failed to stop Telegram updater")
+                try:
+                    if app.running:
+                        await app.stop()
+                except Exception:
+                    logger.exception("Failed to stop Telegram application")
+                try:
+                    await app.shutdown()
+                except Exception:
+                    logger.exception("Failed to shutdown Telegram application")
+
+    try:
+        loop.run_until_complete(_runner())
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
