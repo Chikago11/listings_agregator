@@ -12,7 +12,19 @@ CHANNELS = [
     "bitget_listings",
     "ourbit_listings",
     "hyperliquid_announcements",
+    "FundoorFinds",
 ]
+
+# Channels that post "#EXCHANGE new markets found:" followed by a symbol list.
+# Keep values in lowercase.
+NEW_MARKETS_CHANNELS = {"fundoorfinds"}
+
+# Exchange tags of those channels that are not crypto listings and are ignored.
+# Keep values in uppercase, exactly as the tag is written in the post.
+NEW_MARKETS_SKIP_TAGS = {
+    "MOEX",  # Moscow Exchange stock/commodity futures
+    "BYBIT_TRADFI",  # Bybit MT5 stock CFDs
+}
 
 # Per-channel phrases that indicate the post should be ignored.
 # Keep values in lowercase for case-insensitive matching.

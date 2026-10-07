@@ -195,10 +195,32 @@ EXCHANGE_TITLE_MAP = {
 }
 
 
+# Venues that only arrive pre-tagged from "new markets" feeds. They stay out of
+# EXCHANGE_TITLE_MAP because that map is also matched against free post text,
+# where "orderly" and "backpack" are ordinary words.
+FEED_ONLY_EXCHANGES = (
+    "EdgeX",
+    "BloFin",
+    "Paradex",
+    "Backpack",
+    "Orderly",
+    "RISEx",
+    "Arcus",
+    "Derive",
+    "Pacifica",
+    "ApeX",
+    "Nado",
+    "Lighterhood",
+    "Extended",
+)
+
 # Canonical spellings the parser can emit, in the order shown to subscribers.
 # Every alert carries one of these names or none at all, so this doubles as the
 # list of filter options in the bot menu.
-KNOWN_EXCHANGES = sorted(dict.fromkeys(EXCHANGE_TITLE_MAP.values()), key=str.lower)
+KNOWN_EXCHANGES = sorted(
+    dict.fromkeys((*EXCHANGE_TITLE_MAP.values(), *FEED_ONLY_EXCHANGES)),
+    key=str.lower,
+)
 
 
 def _normalize_exchange_name(name: str | None) -> str | None:
@@ -654,6 +676,107 @@ def extract(text: str) -> dict:
         "quote": quote,  # РєРѕС‚РёСЂРѕРІРєР° (USDT/KRW/BTC/...)
         "display": display,  # РєР°Рє РїРѕРєР°Р·С‹РІР°С‚СЊ РїРѕР»СЊР·РѕРІР°С‚РµР»СЋ
         "confidence": conf,
+    }
+
+
+# Fundoor Finds: "#MEXC_SPOT new markets found:\nCROCUSDT, WFIUSDT".
+NEW_MARKETS_RE = re.compile(
+    r"^\s*#(\w+)\s+new\s+markets\s+found\s*:?\s*(.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+# Venues the rest of the parser does not know. Those outside
+# FEED_ONLY_EXCHANGES reach subscribers under the "other exchanges" switch.
+NEW_MARKETS_TAG_TITLES = {
+    "EDGEX": "EdgeX",
+    "BLOFIN": "BloFin",
+    "ORDERLY": "Orderly",
+    "EXTENDED": "Extended",
+    "RISEX": "RISEx",
+    "ARCUS": "Arcus",
+    "DERIVE": "Derive",
+    "PARADEX": "Paradex",
+    "PACIFICA": "Pacifica",
+    "BACKPACK": "Backpack",
+    "APEX": "ApeX",
+    "NADO": "Nado",
+    "LIGHTERHOOD": "Lighterhood",
+}
+NEW_MARKETS_SYMBOL_RE = re.compile(
+    r"(.+?)[-_/]?(USDT|USDC|USD1|FDUSD|USD)",
+    re.IGNORECASE,
+)
+
+
+def _parse_new_market_symbol(sym_raw: str):
+    """Split a venue-native symbol (SECZ-USDT-SWAP, PF_PONSUSD, xyz:AMEC)."""
+    s = (sym_raw or "").strip()
+    # Hyperliquid HIP-3 markets carry their dex as a prefix: "xyz:AMEC".
+    dex = ""
+    if ":" in s:
+        dex, s = s.split(":", 1)
+        dex = dex.strip().lower()
+        s = s.strip()
+
+    s = re.sub(r"^(?:PERP|PF)_", "", s, flags=re.IGNORECASE)  # Orderly, Kraken
+    s = re.sub(r"_(USD[TC]?)_[A-Za-z0-9]+$", r"_\1", s)  # Orderly broker suffix
+    s = re.sub(r"[-_](?:SWAP|PERP)$", "", s, flags=re.IGNORECASE)  # OKX, Paradex
+    s = re.sub(r"(USD[TC])M$", r"\1", s)  # KuCoin futures: CTUSDTM
+
+    quote = None
+    m = NEW_MARKETS_SYMBOL_RE.fullmatch(s)
+    if m:
+        s = m.group(1)
+        quote = m.group(2).upper()
+
+    base = s.strip(" -_/.").upper()
+    if not base:
+        return None, None, None
+    # Every quote matched above is a stablecoin, so the ticker alone is shown.
+    display = f"{dex}:{base}" if dex else base
+    return base, quote, display
+
+
+def extract_new_markets(text: str) -> dict | None:
+    """
+    Parse a "#TAG new markets found:" post into one venue and its symbols.
+    Returns None when the text is not in that format.
+    """
+    m = NEW_MARKETS_RE.match(text or "")
+    if not m:
+        return None
+
+    tag = m.group(1).upper()
+    venue = tag
+    # The feed tracks perpetuals by default and marks spot explicitly.
+    market_type = "futures"
+    if venue.endswith("_SPOT"):
+        venue = venue[: -len("_SPOT")]
+        market_type = "spot"
+
+    if venue.startswith("HL_"):
+        # HL_XYZ, HL_PARA, ...: third-party dexes deployed on Hyperliquid.
+        exchange = "Hyperliquid"
+    elif venue in NEW_MARKETS_TAG_TITLES:
+        exchange = NEW_MARKETS_TAG_TITLES[venue]
+    else:
+        exchange = _normalize_exchange_name(venue.replace("_", " "))
+        if exchange not in KNOWN_EXCHANGES:
+            exchange = venue.replace("_", " ").title()
+
+    items = []
+    seen = set()
+    for part in re.split(r"[,\n]", m.group(2)):
+        base, quote, display = _parse_new_market_symbol(part)
+        if not base or display in seen:
+            continue
+        seen.add(display)
+        items.append({"base": base, "quote": quote, "display": display})
+
+    return {
+        "tag": tag,
+        "exchange": exchange,
+        "market_type": market_type,
+        "items": items,
     }
 
 

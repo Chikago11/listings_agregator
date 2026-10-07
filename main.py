@@ -35,12 +35,15 @@ from channels import (
     DELISTING_KEYWORD_CHANNELS,
     DELISTING_CHANNEL_SKIP_PHRASES,
     MONITORED_CHANNELS,
+    NEW_MARKETS_CHANNELS,
+    NEW_MARKETS_SKIP_TAGS,
 )
 from db import init_db, is_seen, mark_seen, gc
 from parser import (
     normalize_text,
     extract,
     extract_many,
+    extract_new_markets,
     extract_delisting,
     has_delisting_keyword,
     extract_binance_wallet_announcement,
@@ -499,6 +502,104 @@ async def run():
                                     )
                                 except Exception as e:
                                     print("CSV store error:", repr(e))
+
+                await mark_seen(text_key, DEDUP_TEXT_TTL_SEC)
+                await mark_seen(msg_key, MESSAGE_SEEN_TTL_SEC)
+                return
+
+            # "#EXCHANGE new markets found:" feeds name one venue and a list of
+            # its native symbols. One alert per post: the venue is the same for
+            # every symbol, and a single post can carry dozens of them.
+            if ch_norm in NEW_MARKETS_CHANNELS:
+                nmeta = extract_new_markets(raw_text)
+                if not nmeta or not nmeta["items"]:
+                    print(f"Skip listing parse miss: source={source_tag} msg_id={msg_id}")
+                    log_post_event(
+                        source=str(src_title),
+                        original_post=original_post,
+                        status="skip: listing parse miss",
+                    )
+                    await mark_seen(text_key, DEDUP_TEXT_TTL_SEC)
+                    await mark_seen(msg_key, MESSAGE_SEEN_TTL_SEC)
+                    return
+
+                if nmeta["tag"] in NEW_MARKETS_SKIP_TAGS:
+                    print(f"Skip channel exception: source={source_tag} msg_id={msg_id}")
+                    log_post_event(
+                        source=str(source_tag),
+                        original_post=original_post,
+                        status="skip: channel exception",
+                    )
+                    await mark_seen(text_key, DEDUP_TEXT_TTL_SEC)
+                    await mark_seen(msg_key, MESSAGE_SEEN_TTL_SEC)
+                    return
+
+                nex = nmeta["exchange"]
+                nmarket = nmeta["market_type"]
+                ntag = "F" if nmarket == "futures" else "S"
+
+                new_items = []
+                for item in nmeta["items"]:
+                    nkey = f"s:{nex}:{nmarket}:{item['display']}"
+                    if await is_seen(nkey):
+                        continue
+                    await mark_seen(nkey, DEDUP_STRUCT_TTL_SEC)
+                    new_items.append(item)
+
+                if not new_items:
+                    print(f"Skip struct dedup: source={source_tag} msg_id={msg_id}")
+                    log_post_event(
+                        source=str(source_tag),
+                        original_post=original_post,
+                        status="duplicate",
+                    )
+                    await mark_seen(text_key, DEDUP_TEXT_TTL_SEC)
+                    await mark_seen(msg_key, MESSAGE_SEEN_TTL_SEC)
+                    return
+
+                nurl = None
+                if len(new_items) == 1:
+                    nurl = build_exchange_link(
+                        nex,
+                        nmarket,
+                        base=new_items[0]["base"],
+                        quote=new_items[0]["quote"] or "USDT",
+                    )
+                if nurl:
+                    npart = (
+                        f'<a href="{html.escape(nurl, quote=True)}">'
+                        f"{html.escape(nex)}</a>({ntag})"
+                    )
+                else:
+                    npart = f"{html.escape(nex)}({ntag})"
+
+                nsyms = ", ".join(item["display"] for item in new_items)
+                body_html = shorten_for_html(body_html, parse_text, limit=3000)
+                nalert = (
+                    f"\U0001FA99<b>{html.escape(nsyms)}</b>: {npart}"
+                    f"\n{src_line}\n\n{body_html}"
+                )
+                await send_alert(
+                    nalert,
+                    parse_mode="HTML",
+                    alert_type="listing",
+                    exchange=nex,
+                )
+                log_post_event(
+                    source=str(src_title),
+                    original_post=original_post,
+                    status="sent",
+                    post_for_user=nalert,
+                )
+                for item in new_items:
+                    try:
+                        upsert_listing(
+                            token=item["base"],
+                            market_type=nmarket,
+                            exchange=nex,
+                        )
+                    except Exception as e:
+                        print("CSV store error:", repr(e))
 
                 await mark_seen(text_key, DEDUP_TEXT_TTL_SEC)
                 await mark_seen(msg_key, MESSAGE_SEEN_TTL_SEC)
